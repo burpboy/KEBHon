@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "metadata": {
+    "project_name": "Enterprise Security Assessment & Penetration Testing",
+    "version": "2.4.0",
+    "last_updated": "2026-10-28",
+    "scope_classification": "Confidential / Restricted",
+    "owner": "Red Team & Global Security Operations"
+  },
+  "scope": {
+    "in_scope": {
+      "ip_ranges": [
+        {
+          "cidr": "192.168.100.0/24",
+          "environment": "Production",
+          "region": "ap-southeast-1",
+          "asset_type": "Internal Network",
+          "criticality": "High",
+          "allowed_ports": [80, 443, 22, 3389]
+        },
+        {
+          "cidr": "10.0.50.0/22",
+          "environment": "Staging",
+          "region": "us-east-1",
+          "asset_type": "Cloud VPC Subnet",
+          "criticality": "Medium",
+          "allowed_ports": ["*"]
+        }
+      ],
+      "domains": [
+        {
+          "root_domain": "example.com",
+          "include_subdomains": true,
+          "asset_matrix": {
+            "web_applications": [
+              {
+                "url": "https://app.example.com",
+                "technology_stack": ["React", "Node.js", "PostgreSQL"],
+                "authentication_required": true,
+                "risk_tier": "Critical"
+              },
+              {
+                "url": "https://api.example.com/v1",
+                "technology_stack": ["Go", "GraphQL", "Redis"],
+                "authentication_required": true,
+                "risk_tier": "High"
+              }
+            ],
+            "cloud_assets": [
+              {
+                "provider": "AWS",
+                "resource_type": "S3 Bucket",
+                "identifier": "example-prod-data-backup",
+                "risk_tier": "Medium"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "out_of_scope": {
+      "ip_ranges": [
+        {
+          "cidr": "192.168.100.254/32",
+          "reason": "Gateway / Critical Infrastructure - Do Not Touch"
+        }
+      ],
+      "domains": [
+        {
+          "root_domain": "thirdparty-partner.com",
+          "reason": "Third-party vendor service, outside authorization boundary"
+        }
+      ]
+    }
+  },
+  "rules_of_engagement": {
+    "automated_scanners_allowed": true,
+    "rate_limit_requests_per_second": 50,
+    "destructive_testing_permitted": false,
+    "social_engineering_permitted": false,
+    "emergency_contact": "security-ops@example.com"
+  }
+}
