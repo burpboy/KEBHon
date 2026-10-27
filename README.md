@@ -4,6 +4,8 @@ Platform deteksi dan respons ancaman siber terintegrasi — dari ingestion telem
 
 KEBHon adalah kerangka kerja keamanan siber modular yang menggabungkan pengumpulan data telemetri keamanan, analisis perilaku berbasis ML, agregasi threat intelligence, dan otomatisasi respons (SOAR) dalam satu alur pipeline.
 
+---
+
 Arsitektur
 
 ```
@@ -28,6 +30,8 @@ Arsitektur
 +-------------------------------------------------------------------+
 ```
 
+---
+
 Fitur Utama
 
 · Ingestion Multi-Sumber — Mendukung EDR agent, log CloudTrail, NetFlow, WAF, dan honeypot.
@@ -35,6 +39,8 @@ Fitur Utama
 · Threat Intelligence — Agregasi feed STIX/TAXII dan analisis perilaku berbasis machine learning.
 · SOAR Otomatis — Playbook respons otomatis, peringatan SIEM, dan integrasi dengan sistem SIEM.
 · Modular — Struktur direktori terpisah untuk Core, Modules, Payloads, Config, Logs, dan Tests.
+
+---
 
 Struktur Repositori
 
@@ -48,12 +54,16 @@ Tests/ Unit test dan validasi komponen
 main.py Entry point aplikasi
 requirements.txt Dependensi Python
 
+---
+
 Prasyarat
 
 · Python 3.10+
 · Apache Kafka (cluster, dengan TLS 1.3)
 · Akses ke feed STIX/TAXII (opsional, sesuai kebutuhan)
 · Sistem SIEM target untuk integrasi alerting
+
+---
 
 Instalasi
 
@@ -71,6 +81,8 @@ source venv/bin/activate   # Linux/macOS
 pip install -r requirements.txt
 ```
 
+---
+
 Konfigurasi
 
 1. Siapkan kredensial dan konfigurasi koneksi di direktori Config/.
@@ -78,6 +90,8 @@ Konfigurasi
 3. Sesuaikan endpoint Kafka, feed STIX/TAXII, dan SIEM pada file konfigurasi terkait.
 
 Catatan: Jangan pernah meng-commit kredensial plaintext ke repositori. Gunakan secrets.enc dan variabel lingkungan.
+
+---
 
 Menjalankan
 
@@ -87,6 +101,8 @@ python main.py
 
 Pastikan layanan pendukung (Kafka broker, feed threat intelligence, SIEM) sudah aktif dan dapat dijangkau.
 
+---
+
 Pengujian
 
 ```bash
@@ -94,10 +110,14 @@ Pengujian
 pytest Tests/
 ```
 
+---
+
 Logging & Audit
 
 · Log audit tersimpan di Logs/audit.log.
 · Disarankan melakukan rotasi log dan pengiriman ke SIEM untuk monitoring berkelanjutan.
+
+---
 
 Keamanan
 
@@ -107,6 +127,8 @@ Keamanan
 
 Jika menemukan kerentanan, mohon laporkan secara privat kepada maintainer dan hindari membuat isu publik yang memuat detail eksploitasi.
 
+---
+
 Kontribusi
 
 1. Fork repositori ini.
@@ -115,13 +137,18 @@ Kontribusi
 4. Push ke branch: git push origin fitur/nama-fitur.
 5. Buka Pull Request dengan deskripsi jelas.
 
+---
+
 Lisensi
 
 Lisensi belum ditentukan pada repositori ini. Silakan hubungi maintainer untuk informasi lebih lanjut.
 
+---
+
 Kontak
-• Author : Dwi Joko Purwanto 
-• Repositori: https://github.com/burpboy/KEBHon
+
+· Author: Dwi Joko Purwanto
+· Repositori: https://github.com/burpboy/KEBHon
 
 ---
 
