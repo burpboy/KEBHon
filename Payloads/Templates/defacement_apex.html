@@ -1,1 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HACKED BY HMEI7</title>
+    <style>
+        /* RESET & BASE */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
 
+        body {
+            background-color: #050505; /* Hitam pekat */
+            color: #00ff41; /* Hijau Terminal Klasik */
+            font-family: 'Courier New', Courier, monospace;
+            overflow-x: hidden;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            position: relative;
+        }
+
+        /* BACKGROUND EFFECTS */
+        .scanline {
+            width: 100%;
+            height: 100%;
+            z-index: 9999;
+            background: linear-gradient(
+                to bottom,
+                rgba(255,255,255,0),
+                rgba(255,255,255,0) 50%,
+                rgba(0,0,0,0.2) 50%,
+                rgba(0,0,0,0.2)
+            );
+            background-size: 100% 4px;
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+        }
+
+        canvas#bgCanvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+            opacity: 0.3;
+        }
+
+        /* MAIN CONTAINER */
+        .container {
+            text-align: center;
+            z-index: 10;
+            padding: 2rem;
+            border: 1px solid #00ff41;
+            box-shadow: 0 0 20px rgba(0, 255, 65, 0.2);
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(2px);
+            max-width: 90%;
+            width: 600px;
+        }
+
+        /* GLITCH TEXT STYLE FOR HMEI7 */
+        h1.hacked-by {
+            font-size: 1.2rem;
+            letter-spacing: 5px;
+            margin-bottom: 10px;
+            color: #fff;
+            text-transform: uppercase;
+        }
+
+        h1.main-title {
+            font-size: 3rem;
+            font-weight: bold;
+            position: relative;
+            color: #00ff41;
+            text-shadow: 2px 2px 0px #000, -2px -2px 0px #333;
+            animation: glitch 1s infinite;
+            margin-bottom: 20px;
+        }
+
+        /* Glitch Animation Keyframes */
+        @keyframes glitch {
+            0% { transform: translate(0) }
+            20% { transform: translate(-2px, 2px) }
+            40% { transform: translate(-2px, -2px) }
+            60% { transform: translate(2px, 2px) }
+            80% { transform: translate(2px, -2px) }
+            100% { transform: translate(0) }
+        }
+
+        p.message {
+            font-size: 1rem;
+            line-height: 1.5;
+            margin-bottom: 20px;
+            color: #ccc;
+        }
+
+        .cursor {
+            display: inline-block;
+            width: 10px;
+            height: 1.2em;
+            background-color: #00ff41;
+            animation: blink 1s step-end infinite;
+            vertical-align: middle;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        /* FOOTER / SOCIALS */
+        .footer {
+            margin-top: 20px;
+            font-size: 0.8rem;
+            color: #555;
+            border-top: 1px dashed #00ff41;
+            padding-top: 10px;
+        }
+
+        .social-links a {
+            color: #00ff41;
+            text-decoration: none;
+            margin: 0 10px;
+            font-weight: bold;
+            transition: color 0.3s;
+        }
+
+        .social-links a:hover {
+            color: #fff;
+            text-shadow: 0 0 5px #00ff41;
+        }
+
+        /* RESPONSIVE ADJUSTMENTS */
+        @media (max-width: 600px) {
+            h1.main-title {
+                font-size: 2rem;
+            }
+            .container {
+                padding: 1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Background Matrix/Particles -->
+    <canvas id="bgCanvas"></canvas>
+    
+    <!-- CRT Scanline Overlay -->
+    <div class="scanline"></div>
+
+    <!-- Main Content -->
+    <div class="container">
+        <div class="hacked-by">SYSTEM HAS BEEN HACKED BY</div>
+        
+        <h1 class="main-title">HMEI7</h1>
+        
+        <p class="message">
+            > Thanks To Allah SWT<br>
+            > NO HACK NO FUN<br>
+            > Your site was just a broked<br>
+            <span class="cursor"></span>
+        </p>
+
+        <div class="footer">
+            <p>&copy; 2026 HMEI7 | INDONESIA CYBER HACKER</p>
+            <div class="social-links">
+                <a href="#">ASU</a>
+                <a href="#">BAJINGAN</a>
+                <a href="#">DLOGOK</a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Simple Particle Effect Script for "Elite" feel
+        const canvas = document.getElementById('bgCanvas');
+        const ctx = canvas.getContext('2d');
+
+        let particles = [];
+        const particleCount = 60; // Jumlah partikel (sesuaikan performa)
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        class Particle {
+            constructor() {
+                this.x = Math.random() * canvas.width;
+                this.y = Math.random() * canvas.height;
+                this.size = Math.random() * 2 + 1;
+                this.speedX = Math.random() * 1 - 0.5;
+                this.speedY = Math.random() * 1 - 0.5;
+                this.color = '#00ff41';
+            }
+
+            update() {
+                this.x += this.speedX;
+                this.y += this.speedY;
+
+                if (this.x > canvas.width || this.x < 0) this.speedX *= -1;
+                if (this.y > canvas.height || this.y < 0) this.speedY *= -1;
+            }
+
+            draw() {
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fill();
+                
+                // Draw lines between close particles
+                for (let i = 0; i < particles.length; i++) {
+                    const dx = particles[i].x - this.x;
+                    const dy = particles[i].y - this.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+                    
+                    if (distance < 100) {
+                        ctx.strokeStyle = `rgba(0, 255, 65, ${0.1 - distance/1000})`;
+                        ctx.lineWidth = 0.5;
+                        ctx.beginPath();
+                        ctx.moveTo(this.x, this.y);
+                        ctx.lineTo(particles[i].x, particles[i].y);
+                        ctx.stroke();
+                    }
+                }
+            }
+        }
+
+        function initParticles() {
+            for (let i = 0; i < particleCount; i++) {
+                particles.push(new Particle());
+            }
+        }
+
+        function animate() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            particles.forEach(p => {
+                p.update();
+                p.draw();
+            });
+            requestAnimationFrame(animate);
+        }
+
+        initParticles();
+        animate();
+    </script>
+</body>
+</html>
