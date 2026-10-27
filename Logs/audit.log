@@ -1,0 +1,103 @@
+import hashlib
+import json
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+
+class ImmutableLogBlock:
+    """Mewakili satu blok/entri dalam log eksekusi immutable."""
+
+    def __init__(self, index: int, previous_hash: str, data: Dict[str, Any]) -> None:
+        self.index: int = index
+        self.timestamp: str = datetime.utcnow().isoformat()
+        self.previous_hash: str = previous_hash
+        self.data: Dict[str, Any] = data
+        self.nonce: int = 0
+        self.hash: str = self.calculate_hash()
+
+    def calculate_hash(self) -> str:
+        """Menghitung SHA-256 hash berdasarkan isi blok."""
+        block_content = {
+            "index": self.index,
+            "timestamp": self.timestamp,
+            "previous_hash": self.previous_hash,
+            "data": self.data,
+            "nonce": self.nonce,
+        }
+        encoded_block = json.dumps(block_content, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded_block).hexdigest()
+
+
+class AuditLog:
+    """Mengelola rantai log eksekusi yang aman dan tidak dapat diubah (immutable)."""
+
+    def __init__(self) -> None:
+        self._chain: List[ImmutableLogBlock] = []
+        self._initialize_genesis_block()
+
+    def _initialize_genesis_block(self) -> None:
+        """Membuat blok pertama (genesis block) untuk memulai rantai log."""
+        genesis_data = {"event": "SYSTEM_INITIALIZED", "actor": "SYSTEM"}
+        genesis_block = ImmutableLogBlock(
+            index=0, previous_hash="0" * 64, data=genesis_data
+        )
+        self._chain.append(genesis_block)
+
+    def record_execution(self, execution_data: Dict[str, Any]) -> ImmutableLogBlock:
+        """Merekam eksekusi baru ke dalam log dengan mengikat hash sebelumnya."""
+        if not isinstance(execution_data, dict):
+            raise TypeError("Data eksekusi harus berupa dictionary.")
+
+        previous_block = self._chain[-1]
+        new_block = ImmutableLogBlock(
+            index=previous_block.index + 1,
+            previous_hash=previous_block.hash,
+            data=execution_data,
+        )
+        self._chain.append(new_block)
+        return new_block
+
+    def verify_integrity(self) -> bool:
+        """Memeriksa integritas seluruh rantai log dari manipulasi."""
+        for i in range(1, len(self._chain)):
+            current_block = self._chain[i]
+            previous_block = self._chain[i - 1]
+
+            # Verifikasi apakah hash saat ini cocok dengan isinya
+            if current_block.hash != current_block.calculate_hash():
+                return False
+
+            # Verifikasi apakah tautan ke blok sebelumnya valid
+            if current_block.previous_hash != previous_block.hash:
+                return False
+
+        return True
+
+    def get_logs(self) -> List[Dict[str, Any]]:
+        """Mengembalikan salinan seluruh entri log."""
+        return [
+            {
+                "index": block.index,
+                "timestamp": block.timestamp,
+                "previous_hash": block.previous_hash,
+                "hash": block.hash,
+                "data": block.data,
+            }
+            for block in self._chain
+        ]
+
+
+# Contoh Penggunaan
+if __name__ == "__main__":
+    audit = AuditLog()
+
+    # Merekam beberapa aksi eksekusi
+    audit.record_execution({"action": "USER_LOGIN", "username": "admin", "status": "SUCCESS"})
+    audit.record_execution({"action": "DELETE_RECORD", "table": "users", "record_id": 42})
+
+    # Validasi integritas awal
+    print("Integritas Log Valid:", audit.verify_integrity())
+
+    # Menampilkan hasil log
+    import pprint
+    pprint.pprint(audit.get_logs())
