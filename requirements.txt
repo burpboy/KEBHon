@@ -1,0 +1,15 @@
+# ==========================================
+# Production Dependencies - Secure & Optimized
+# ==========================================
+
+# Core cryptographic recipes and primitives
+cryptography==42.0.8
+
+# Powerful packet manipulation and network analysis framework
+scapy==2.5.5
+
+# Asynchronous HTTP client/server for high-performance network tasks
+aiohttp==3.9.5
+
+# Fast YAML parser and emitter for configuration management
+PyYAML==6.0.1
