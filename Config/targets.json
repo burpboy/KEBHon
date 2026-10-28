@@ -1,83 +1,151 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$schema": "http://json-schema.org/draft-07/schema#",
   "metadata": {
-    "project_name": "Enterprise Security Assessment & Penetration Testing",
-    "version": "2.4.0",
-    "last_updated": "2026-10-28",
-    "scope_classification": "Confidential / Restricted",
-    "owner": "Red Team & Global Security Operations"
+    "version": "1.0.0",
+    "lastUpdated": "2023-10-27T00:00:00Z",
+    "author": "Dw Joko Purwanto",
+    "description": "Structured Target Scope, IP Ranges, & Asset Matrices"
   },
-  "scope": {
-    "in_scope": {
-      "ip_ranges": [
+  "scopes": [
+    {
+      "id": "scope-prod-web",
+      "name": "Production Web Tier",
+      "environment": "production",
+      "status": "active",
+      "ipRanges": [
         {
-          "cidr": "192.168.100.0/24",
-          "environment": "Production",
-          "region": "ap-southeast-1",
-          "asset_type": "Internal Network",
-          "criticality": "High",
-          "allowed_ports": [80, 443, 22, 3389]
+          "cidr": "10.0.1.0/24",
+          "label": "Web Servers Subnet",
+          "region": "us-east-1"
         },
         {
-          "cidr": "10.0.50.0/22",
-          "environment": "Staging",
-          "region": "us-east-1",
-          "asset_type": "Cloud VPC Subnet",
-          "criticality": "Medium",
-          "allowed_ports": ["*"]
+          "cidr": "10.0.2.0/24",
+          "label": "Application Servers Subnet",
+          "region": "us-east-1"
         }
       ],
       "domains": [
+        "app.example.com",
+        "api.example.com",
+        "cdn.example.com"
+      ]
+    },
+    {
+      "id": "scope-prod-db",
+      "name": "Production Database Tier",
+      "environment": "production",
+      "status": "active",
+      "ipRanges": [
         {
-          "root_domain": "example.com",
-          "include_subdomains": true,
-          "asset_matrix": {
-            "web_applications": [
-              {
-                "url": "https://app.example.com",
-                "technology_stack": ["React", "Node.js", "PostgreSQL"],
-                "authentication_required": true,
-                "risk_tier": "Critical"
-              },
-              {
-                "url": "https://api.example.com/v1",
-                "technology_stack": ["Go", "GraphQL", "Redis"],
-                "authentication_required": true,
-                "risk_tier": "High"
-              }
-            ],
-            "cloud_assets": [
-              {
-                "provider": "AWS",
-                "resource_type": "S3 Bucket",
-                "identifier": "example-prod-data-backup",
-                "risk_tier": "Medium"
-              }
-            ]
-          }
+          "cidr": "10.0.10.0/24",
+          "label": "Database Servers Subnet",
+          "region": "us-east-1"
+        }
+      ],
+      "ports": [
+        {
+          "port": 5432,
+          "protocol": "tcp",
+          "service": "PostgreSQL"
+        },
+        {
+          "port": 6379,
+          "protocol": "tcp",
+          "service": "Redis"
         }
       ]
     },
-    "out_of_scope": {
-      "ip_ranges": [
+    {
+      "id": "scope-staging",
+      "name": "Staging Environment",
+      "environment": "staging",
+      "status": "active",
+      "ipRanges": [
         {
-          "cidr": "192.168.100.254/32",
-          "reason": "Gateway / Critical Infrastructure - Do Not Touch"
+          "cidr": "172.16.0.0/24",
+          "label": "Staging VPC Subnet",
+          "region": "us-west-2"
         }
       ],
       "domains": [
-        {
-          "root_domain": "thirdparty-partner.com",
-          "reason": "Third-party vendor service, outside authorization boundary"
-        }
+        "staging-app.example.com",
+        "staging-api.example.com"
       ]
     }
-  },
-  "rules_of_engagement": {
-    "automated_scanners_allowed": true,
-    "rate_limit_requests_per_second": 50,
-    "destructive_testing_permitted": false,
-    "social_engineering_permitted": false,
-    "emergency_contact": "security-ops@example.com"
+  ],
+  "assets": [
+    {
+      "assetId": "web-srv-01",
+      "name": "Primary Web Server",
+      "type": "server",
+      "os": "Ubuntu 22.04 LTS",
+      "ipAddress": "10.0.1.10",
+      "macAddress": "00:1A:2B:3C:4D:5E",
+      "criticality": "high",
+      "owner": "DevOps Team",
+      "tags": ["nginx", "ssl", "public-facing"],
+      "services": [
+        {
+          "port": 80,
+          "protocol": "tcp",
+          "status": "open",
+          "banner": "nginx/1.24.0"
+        },
+        {
+          "port": 443,
+          "protocol": "tcp",
+          "status": "open",
+          "banner": "nginx/1.24.0"
+        }
+      ]
+    },
+    {
+      "assetId": "db-srv-01",
+      "name": "Primary Database Server",
+      "type": "database",
+      "os": "CentOS 8",
+      "ipAddress": "10.0.10.10",
+      "macAddress": "00:1A:2B:3C:4D:6F",
+      "criticality": "critical",
+      "owner": "DBA Team",
+      "tags": ["postgresql", "internal-only"],
+      "services": [
+        {
+          "port": 5432,
+          "protocol": "tcp",
+          "status": "open",
+          "banner": "PostgreSQL 14.5"
+        }
+      ]
+    },
+    {
+      "assetId": "lb-01",
+      "name": "Load Balancer",
+      "type": "network-device",
+      "os": "AWS ALB",
+      "ipAddress": "10.0.0.1",
+      "macAddress": null,
+      "criticality": "high",
+      "owner": "Infrastructure Team",
+      "tags": ["aws", "load-balancer"],
+      "services": []
+    }
+  ],
+  "rules": {
+    "rateLimiting": {
+      "enabled": true,
+      "requestsPerMinute": 60,
+      "burstSize": 10
+    },
+    "authentication": {
+      "method": "token-based",
+      "expiryMinutes": 30,
+      "refreshTokenEnabled": true
+    },
+    "logging": {
+      "level": "info",
+      "destination": "elasticsearch",
+      "retentionDays": 90
+    }
   }
 }
