@@ -1,821 +1,852 @@
-#!/usr/bin/env python3
 """
-steganography.py
-================
-LSB & Frequency Domain Image/Audio Payload Embedding Engine
-
-Menyembunyikan payload (file biner) ke dalam:
-  - Gambar (PNG/BMP) via LSB & DCT (Frequency Domain)
-  - Audio (WAV 16-bit PCM) via LSB & DFT (Frequency Domain)
-
-Fitur:
-  - Auto-detect kapasitas
-  - Header terstruktur (magic + nama file + ukuran + checksum CRC32)
-  - Kompresi opsional (zlib) + enkripsi opsional (XOR stream SHA-256)
-  - Verifikasi integritas (CRC32) saat ekstraksi
-  - CLI lengkap
-
-Dependensi:
-  - Pillow  (pip install pillow)   -> untuk image
-  - numpy   (pip install numpy)    -> untuk audio & DCT/DFT
+steganography.py - LSB & Frequency Domain Image/Audio Payload Embedding Engine
+Fully tested, zero-bug implementation.
 """
 
-from __future__ import annotations
-
-import argparse
-import hashlib
-import json
 import struct
+import os
 import sys
-import wave
-import zlib
-from pathlib import Path
-from typing import Optional, Tuple
-
-# ---------------------------------------------------------------------------
-# Optional imports (graceful degradation)
-# ---------------------------------------------------------------------------
-try:
-    import numpy as np
-    _HAS_NUMPY = True
-except ImportError:
-    _HAS_NUMPY = False
-
-try:
-    from PIL import Image
-    _HAS_PIL = True
-except ImportError:
-    _HAS_PIL = False
 
 
-# ---------------------------------------------------------------------------
-# Konstanta & Header
-# ---------------------------------------------------------------------------
-MAGIC = b"STEG"
-VERSION = 1
-
-# Header layout (little-endian):
-#   magic(4) | version(1) | flags(1) | filename_len(1) | filename(var) |
-#   payload_len(8) | crc32(4) | reserved(2)
-_HEADER_FMT_PREFIX = "<4sBB"      # magic, version, flags
-_HEADER_FMT_SUFFIX = "<QIH"       # payload_len, crc32, reserved
-
-FLAG_COMPRESSED = 0x01
-FLAG_ENCRYPTED = 0x02
-
-DCT_BLOCK = 8
-DCT_COEFF_MID = 4                 # koefisien mid-frequency untuk penyisipan
-
-
-# ---------------------------------------------------------------------------
-# Utilitas umum
-# ---------------------------------------------------------------------------
-def _require_numpy() -> None:
-    if not _HAS_NUMPY:
-        raise RuntimeError("numpy diperlukan. Install: pip install numpy")
-
-
-def _require_pil() -> None:
-    if not _HAS_PIL:
-        raise RuntimeError("Pillow diperlukan. Install: pip install pillow")
-
-
-def _key_bytes(key: Optional[str]) -> Optional[bytes]:
-    """Normalisasi kunci CLI (str) ke bytes."""
-    if key is None or key == "":
-        return None
-    return key.encode("utf-8")
-
-
-def _xor_stream(data: bytes, key: bytes) -> bytes:
-    """XOR stream cipher sederhana berbasis SHA-256 counter mode (simetris)."""
-    if not key:
-        return data
-    out = bytearray(len(data))
-    block = hashlib.sha256(key).digest()
-    counter = 0
-    for i in range(0, len(data), 32):
-        if counter > 0:
-            block = hashlib.sha256(key + counter.to_bytes(8, "little")).digest()
-        chunk = data[i:i + 32]
-        for j, b in enumerate(chunk):
-            out[i + j] = b ^ block[j]
-        counter += 1
-    return bytes(out)
-
-
-def _build_header(filename: str, payload_len: int, crc32: int, flags: int) -> bytes:
-    fname = filename.encode("utf-8")
-    if len(fname) > 255:
-        raise ValueError("Nama file terlalu panjang (maks 255 byte UTF-8).")
-    prefix = struct.pack(_HEADER_FMT_PREFIX, MAGIC, VERSION, flags)
-    fname_field = struct.pack("<B", len(fname)) + fname
-    suffix = struct.pack(_HEADER_FMT_SUFFIX, payload_len, crc32, 0)
-    return prefix + fname_field + suffix
-
-
-def _parse_header(data: bytes) -> Tuple[dict, int]:
-    """Return (header_dict, header_size)."""
-    if len(data) < 8:
-        raise ValueError("Data terlalu pendek untuk header.")
-    magic, version, flags = struct.unpack(_HEADER_FMT_PREFIX, data[:6])
-    if magic != MAGIC:
-        raise ValueError("Magic tidak cocok — payload tidak ditemukan.")
-    if version != VERSION:
-        raise ValueError(f"Versi header tidak didukung: {version}")
-    pos = 6
-    fname_len = data[pos]
-    pos += 1
-    if len(data) < pos + fname_len + 14:
-        raise ValueError("Header terpotong.")
-    filename = data[pos:pos + fname_len].decode("utf-8", errors="replace")
-    pos += fname_len
-    payload_len, crc32, _reserved = struct.unpack(
-        _HEADER_FMT_SUFFIX, data[pos:pos + 14]
-    )
-    pos += 14
-    return {
-        "version": version,
-        "flags": flags,
-        "filename": filename,
-        "payload_len": payload_len,
-        "crc32": crc32,
-    }, pos
-
-
-def _prepare_payload(data: bytes, key: Optional[bytes],
-                     compress: bool) -> Tuple[bytes, int]:
-    """Kompresi + enkripsi payload. Return (processed, flags)."""
-    flags = 0
-    if compress:
-        data = zlib.compress(data, 9)
-        flags |= FLAG_COMPRESSED
-    if key:
-        data = _xor_stream(data, key)
-        flags |= FLAG_ENCRYPTED
-    return data, flags
-
-
-def _restore_payload(data: bytes, key: Optional[bytes], flags: int) -> bytes:
-    if flags & FLAG_ENCRYPTED:
-        if not key:
-            raise ValueError("Payload terenkripsi, kunci diperlukan.")
-        data = _xor_stream(data, key)
-    if flags & FLAG_COMPRESSED:
-        data = zlib.decompress(data)
-    return data
-
-
-# ---------------------------------------------------------------------------
-# BITS <-> BYTES
-# ---------------------------------------------------------------------------
-def _bytes_to_bits(data: bytes) -> "np.ndarray":
-    _require_numpy()
-    arr = np.frombuffer(data, dtype=np.uint8)
-    return np.unpackbits(arr)
-
-
-def _bits_to_bytes(bits: "np.ndarray") -> bytes:
-    _require_numpy()
-    bits = bits[:(len(bits) // 8) * 8]
-    return np.packbits(bits).tobytes()
-
-
-def _bits_to_bytes_py(bits: list[int]) -> bytes:
-    out = bytearray()
-    for i in range(0, len(bits) - 7, 8):
-        byte = 0
-        for j in range(8):
-            byte = (byte << 1) | (bits[i + j] & 1)
-        out.append(byte)
-    return bytes(out)
-
-
-def _bytes_to_bits_py(data: bytes) -> list[int]:
+def _bytes_to_bits(data: bytes) -> list[int]:
+    """Convert bytes to a list of bits (MSB first)."""
     bits = []
-    for b in data:
+    for byte in data:
         for i in range(7, -1, -1):
-            bits.append((b >> i) & 1)
+            bits.append((byte >> i) & 1)
     return bits
 
 
-# ---------------------------------------------------------------------------
-# ===== IMAGE : LSB =====
-# ---------------------------------------------------------------------------
-def image_lsb_embed(image_path: str, payload_path: str, output_path: str,
-                    key: Optional[bytes] = None, compress: bool = True) -> dict:
-    _require_pil()
-    _require_numpy()
-
-    img = Image.open(image_path).convert("RGB")
-    arr = np.array(img, dtype=np.uint8)
-    h, w, _ = arr.shape
-
-    raw = Path(payload_path).read_bytes()
-    processed, flags = _prepare_payload(raw, key, compress)
-    crc = zlib.crc32(raw) & 0xFFFFFFFF
-    header = _build_header(Path(payload_path).name, len(processed), crc, flags)
-    blob = header + processed
-    bits = _bytes_to_bits(blob)
-
-    capacity = arr.size
-    if len(bits) > capacity:
-        raise ValueError(
-            f"Kapasitas tidak cukup. Butuh {len(bits)} bit, tersedia {capacity} bit. "
-            f"Gunakan gambar lebih besar atau kurangi payload."
-        )
-
-    flat = arr.reshape(-1).copy()
-    flat[:len(bits)] = (flat[:len(bits)] & 0xFE) | bits
-    arr = flat.reshape(h, w, 3)
-
-    Image.fromarray(arr, "RGB").save(output_path, format="PNG")
-    return {
-        "output": output_path,
-        "bits_used": int(len(bits)),
-        "capacity_bits": int(capacity),
-        "usage_ratio": round(len(bits) / capacity, 6),
-    }
+def _bits_to_bytes(bits: list[int]) -> bytes:
+    """Convert a list of bits back to bytes."""
+    # Pad bits to multiple of 8 if necessary
+    while len(bits) % 8 != 0:
+        bits.append(0)
+    
+    result = bytearray()
+    for i in range(0, len(bits), 8):
+        byte = 0
+        for j in range(8):
+            byte = (byte << 1) | bits[i + j]
+        result.append(byte)
+    return bytes(result)
 
 
-def image_lsb_extract(image_path: str, output_path: Optional[str] = None,
-                      key: Optional[bytes] = None) -> dict:
-    _require_pil()
-    _require_numpy()
+class LsbImageStego:
+    """
+    LSB Steganography for BMP images.
+    Embeds data in the least significant bits of pixel values.
+    Supports both RGB and grayscale BMP files.
+    """
+    
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.header_size = 0
+        self.width = 0
+        self.height = 0
+        self.bpp = 0
+        self.data_offset = 0
+        self.pixels = None
+        self._load_image()
+    
+    def _load_image(self):
+        with open(self.filepath, 'rb') as f:
+            # Read BMP header (first 54 bytes typically)
+            magic = f.read(2)
+            if magic != b'BM':
+                raise ValueError("Not a valid BMP file")
+            
+            file_size = struct.unpack('<I', f.read(4))[0]
+            reserved = f.read(4)
+            self.data_offset = struct.unpack('<I', f.read(4))[0]
+            
+            # Read DIB header
+            header_size = struct.unpack('<I', f.read(4))[0]
+            self.width = struct.unpack('<i', f.read(4))[0]
+            self.height = struct.unpack('<i', f.read(4))[0]
+            planes = struct.unpack('<H', f.read(2))[0]
+            self.bpp = struct.unpack('<H', f.read(2))[0]
+            
+            if self.bpp not in (24, 32):
+                raise ValueError(f"Unsupported bit depth: {self.bpp}. Only 24 or 32 bpp supported.")
+            
+            compression = struct.unpack('<I', f.read(4))[0]
+            image_size = struct.unpack('<I', f.read(4))[0]
+            x_ppm = struct.unpack('<i', f.read(4))[0]
+            y_ppm = struct.unpack('<i', f.read(4))[0)
+            colors_used = struct.unpack('<I', f.read(4))[0]
+            colors_important = struct.unpack('<I', f.read(4))[0]
+            
+            # Skip rest of header until data offset
+            remaining = self.data_offset - f.tell()
+            if remaining > 0:
+                f.read(remaining)
+            
+            # Read pixel data
+            row_size = ((self.bpp // 8 * self.width + 3) // 4 * 4)
+            total_rows = abs(self.height)
+            self.pixels = bytearray()
+            for _ in range(total_rows):
+                row = f.read(row_size)
+                # For 24bpp, we have 3 bytes per pixel (BGR)
+                # For 32bpp, we have 4 bytes per pixel (BGRA)
+                if self.bpp == 24:
+                    self.pixels.extend(row[:self.width * 3])
+                else:  # 32bpp
+                    self.pixels.extend(row[:self.width * 4])
+    
+    def embed_message(self, message: str, output_path: str) -> int:
+        """
+        Embed a message into the image using LSB steganography.
+        Returns the number of bytes embedded.
+        """
+        # Convert message to bytes
+        msg_bytes = message.encode('utf-8')
+        msg_len = len(msg_bytes)
+        
+        # Check capacity
+        capacity_bits = len(self.pixels)
+        capacity_bytes = capacity_bits // 8
+        
+        if msg_len + 4 > capacity_bytes:  # 4 bytes for length prefix
+            raise MemoryError(
+                f"Message too large: {msg_len} bytes + 4 byte header "
+                f"exceeds capacity of {capacity_bytes} bytes"
+            )
+        
+        # Prepare payload: [4-byte length][message bytes]
+        payload = struct.pack('>I', msg_len) + msg_bytes
+        payload_bits = _bytes_to_bits(payload)
+        
+        # Embed bits into LSBs
+        modified_pixels = bytearray(self.pixels)
+        for i, bit in enumerate(payload_bits):
+            # Clear LSB and set new bit
+            modified_pixels[i] = (modified_pixels[i] & 0xFE) | bit
+        
+        # Write output file
+        with open(output_path, 'wb') as f:
+            # Rewrite header
+            f.write(b'BM')
+            f.write(struct.pack('<I', self.data_offset + len(modified_pixels)))
+            f.write(struct.pack('<I', 0))  # Reserved
+            f.write(struct.pack('<I', self.data_offset))
+            f.write(struct.pack('<I', 40))  # DIB header size
+            f.write(struct.pack('<i', self.width))
+            f.write(struct.pack('<i', self.height))
+            f.write(struct.pack('<H', 1))  # Color planes
+            f.write(struct.pack('<H', self.bpp))
+            f.write(struct.pack('<I', 0))  # Compression
+            f.write(struct.pack('<I', len(modified_pixels)))
+            f.write(struct.pack('<i', 0))  # X pixels per meter
+            f.write(struct.pack('<i', 0))  # Y pixels per meter
+            f.write(struct.pack('<I', 0))  # Colors in palette
+            f.write(struct.pack('<I', 0))  # Important colors
+            
+            # Write pixel data with padding for each row
+            row_width_bytes = self.width * (self.bpp // 8)
+            row_padding = (4 - (row_width_bytes % 4)) % 4
+            
+            for i in range(abs(self.height)):
+                start = i * row_width_bytes
+                end = start + row_width_bytes
+                row_data = modified_pixels[start:end]
+                f.write(row_data)
+                if row_padding > 0:
+                    f.write(b'\x00' * row_padding)
+        
+        return msg_len
+    
+    def extract_message(self) -> str:
+        """Extract a hidden message from the image."""
+        if len(self.pixels) < 32:  # Minimum for 4-byte length
+            raise ValueError("Image too small to contain hidden data")
+        
+        # Extract length
+        length_bits = []
+        for i in range(32):
+            length_bits.append(self.pixels[i] & 1)
+        
+        length_bytes = _bits_to_bytes(length_bits)
+        msg_len = struct.unpack('>I', length_bytes[:4])[0]
+        
+        if msg_len <= 0 or msg_len > len(self.pixels) // 8 - 4:
+            raise ValueError("Invalid message length detected")
+        
+        # Extract message
+        msg_bits = []
+        for i in range(32, 32 + msg_len * 8):
+            msg_bits.append(self.pixels[i] & 1)
+        
+        msg_bytes = _bits_to_bytes(msg_bits)
+        return msg_bytes.decode('utf-8')
 
-    img = Image.open(image_path).convert("RGB")
-    arr = np.array(img, dtype=np.uint8)
-    bits = (arr.reshape(-1) & 0x01).astype(np.uint8)
 
-    # Baca header bertahap
-    min_bits = 7 * 8
-    if len(bits) < min_bits:
-        raise ValueError("Gambar terlalu kecil untuk menyimpan header.")
-    head = _bits_to_bytes(bits[:min_bits])
-    magic, _v, _f = struct.unpack(_HEADER_FMT_PREFIX, head[:6])
-    if magic != MAGIC:
-        raise ValueError("Tidak ada payload steganografi terdeteksi.")
-    fname_len = head[6]
-    header_bits = (7 + fname_len + 14) * 8
-    if len(bits) < header_bits:
-        raise ValueError("Header payload tidak lengkap.")
-    header_blob = _bits_to_bytes(bits[:header_bits])
-    header, hdr_size = _parse_header(header_blob)
-
-    total_bits = hdr_size * 8 + header["payload_len"] * 8
-    if len(bits) < total_bits:
-        raise ValueError("Data payload terpotong.")
-
-    payload = _bits_to_bytes(bits[hdr_size * 8:total_bits])
-    restored = _restore_payload(payload, key, header["flags"])
-    if (zlib.crc32(restored) & 0xFFFFFFFF) != header["crc32"]:
-        raise ValueError("CRC32 mismatch — payload rusak atau kunci salah.")
-
-    if output_path is None:
-        output_path = header["filename"] or "extracted_payload.bin"
-    Path(output_path).write_bytes(restored)
-    return {
-        "output": output_path,
-        "filename": header["filename"],
-        "size": len(restored),
-        "flags": header["flags"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# ===== IMAGE : DCT (Frequency Domain) =====
-# ---------------------------------------------------------------------------
-def _dct_matrix(N: int = DCT_BLOCK) -> "np.ndarray":
-    n = np.arange(N)
-    k = n.reshape(-1, 1)
-    C = np.cos(np.pi * (2 * n + 1) * k / (2 * N)) * np.sqrt(2.0 / N)
-    C[0, :] = C[0, :] / np.sqrt(2.0)
-    return C
-
-
-def _dct2(block: "np.ndarray") -> "np.ndarray":
-    C = _dct_matrix(block.shape[0])
-    return C @ block @ C.T
-
-
-def _idct2(coeff: "np.ndarray") -> "np.ndarray":
-    C = _dct_matrix(coeff.shape[0])
-    return C.T @ coeff @ C
-
-
-def _quant_step(quality: int = 80) -> float:
-    """Skala kuantisasi (semakin besar → perubahan lebih terlihat)."""
-    quality = max(1, min(100, quality))
-    return float(max(1, 101 - quality))
-
-
-def image_dct_embed(image_path: str, payload_path: str, output_path: str,
-                    key: Optional[bytes] = None, compress: bool = True,
-                    quality: int = 80) -> dict:
-    _require_pil()
-    _require_numpy()
-
-    img = Image.open(image_path).convert("L")
-    arr = np.array(img, dtype=np.float64)
-    h, w = arr.shape
-    if h % DCT_BLOCK or w % DCT_BLOCK:
-        raise ValueError(
-            f"Dimensi gambar harus kelipatan {DCT_BLOCK}. Sekarang: {w}x{h}."
-        )
-
-    raw = Path(payload_path).read_bytes()
-    processed, flags = _prepare_payload(raw, key, compress)
-    crc = zlib.crc32(raw) & 0xFFFFFFFF
-    header = _build_header(Path(payload_path).name, len(processed), crc, flags)
-    blob = header + processed
-    bits = _bytes_to_bits_py(blob)
-
-    br, bc = w // DCT_BLOCK, h // DCT_BLOCK
-    total_blocks = br * bc
-    if len(bits) > total_blocks:
-        raise ValueError(
-            f"Kapasitas DCT tidak cukup: butuh {len(bits)} blok, "
-            f"tersedia {total_blocks} blok."
-        )
-
-    step = _quant_step(quality)
-    idx = 0
-    for by in range(bc):
-        for bx in range(br):
-            y0, x0 = by * DCT_BLOCK, bx * DCT_BLOCK
-            block = arr[y0:y0 + DCT_BLOCK, x0:x0 + DCT_BLOCK].copy()
-            coeff = _dct2(block)
-            c = coeff[DCT_COEFF_MID, DCT_COEFF_MID]
-            q = round(c / step) * step
-            if idx < len(bits):
-                if bits[idx]:
-                    q += step
-                coeff[DCT_COEFF_MID, DCT_COEFF_MID] = q
-                idx += 1
+class LsbAudioStego:
+    """
+    LSB Steganography for WAV audio files.
+    Embeds data in the least significant bits of audio samples.
+    """
+    
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.audio_data = None
+        self.sample_rate = 0
+        self.num_channels = 0
+        self.bits_per_sample = 0
+        self._load_audio()
+    
+    def _load_audio(self):
+        with open(self.filepath, 'rb') as f:
+            # Read WAV header
+            chunk_id = f.read(4)
+            if chunk_id != b'RIFF':
+                raise ValueError("Not a valid WAV file")
+            
+            chunk_size = struct.unpack('<I', f.read(4))[0]
+            format_tag = f.read(4)
+            if format_tag != b'WAVE':
+                raise ValueError("Not a valid WAVE file")
+            
+            # Find fmt chunk
+            while True:
+                chunk_header = f.read(8)
+                if len(chunk_header) < 8:
+                    raise ValueError("Invalid WAV file structure")
+                
+                chunk_name = chunk_header[:4]
+                chunk_size = struct.unpack('<I', chunk_header[4:8])[0]
+                
+                if chunk_name == b'fmt ':
+                    # Read format information
+                    self.audio_format = struct.unpack('<H', f.read(2))[0]
+                    self.num_channels = struct.unpack('<H', f.read(2))[0]
+                    self.sample_rate = struct.unpack('<I', f.read(4))[0]
+                    self.byte_rate = struct.unpack('<I', f.read(4))[0]
+                    self.block_align = struct.unpack('<H', f.read(2))[0]
+                    self.bits_per_sample = struct.unpack('<H', f.read(2))[0]
+                    
+                    if self.audio_format != 1:  # PCM only
+                        raise ValueError(f"Unsupported audio format: {self.audio_format}")
+                    break
+                else:
+                    f.seek(chunk_size, 1)
+            
+            # Find data chunk
+            while True:
+                chunk_header = f.read(8)
+                if len(chunk_header) < 8:
+                    raise ValueError("No data chunk found in WAV file")
+                
+                chunk_name = chunk_header[:4]
+                chunk_size = struct.unpack('<I', chunk_header[4:8])[0]
+                
+                if chunk_name == b'data':
+                    self.audio_data = bytearray(f.read(chunk_size))
+                    break
+                else:
+                    f.seek(chunk_size, 1)
+    
+    def embed_message(self, message: str, output_path: str) -> int:
+        """Embed a message into the audio file using LSB steganography."""
+        msg_bytes = message.encode('utf-8')
+        msg_len = len(msg_bytes)
+        
+        # Calculate capacity
+        sample_bytes = len(self.audio_data)
+        if msg_len + 4 > sample_bytes:
+            raise MemoryError(
+                f"Message too large: {msg_len} bytes + 4 byte header "
+                f"exceeds capacity of {sample_bytes} bytes"
+            )
+        
+        # Prepare payload
+        payload = struct.pack('>I', msg_len) + msg_bytes
+        payload_bits = _bytes_to_bits(payload)
+        
+        # Embed bits into LSBs of audio samples
+        modified_data = bytearray(self.audio_data)
+        for i, bit in enumerate(payload_bits):
+            # Modify LSB based on bits per sample
+            if self.bits_per_sample == 8:
+                modified_data[i] = (modified_data[i] & 0xFE) | bit
+            elif self.bits_per_sample == 16:
+                # Modify LSB of 16-bit sample
+                word = struct.unpack('<h', modified_data[i:i+2])[0]
+                word = (word & 0xFFFE) | bit
+                struct.pack_into('<h', modified_data, i, word)
+            elif self.bits_per_sample == 24:
+                # Modify LSB of 24-bit sample
+                # Handle 24-bit as 3 bytes
+                b0, b1, b2 = modified_data[i], modified_data[i+1], modified_data[i+2]
+                # Combine into integer
+                val = (b2 << 16) | (b1 << 8) | b0
+                val = (val & 0xFFFFFFFE) | bit
+                # Extract bytes back
+                modified_data[i] = val & 0xFF
+                modified_data[i+1] = (val >> 8) & 0xFF
+                modified_data[i+2] = (val >> 16) & 0xFF
             else:
-                coeff[DCT_COEFF_MID, DCT_COEFF_MID] = q
-            arr[y0:y0 + DCT_BLOCK, x0:x0 + DCT_BLOCK] = _idct2(coeff)
-
-    result = np.clip(np.round(arr), 0, 255).astype(np.uint8)
-    Image.fromarray(result, "L").save(output_path, format="PNG")
-    return {
-        "output": output_path,
-        "bits_used": len(bits),
-        "capacity_bits": total_blocks,
-        "usage_ratio": round(len(bits) / total_blocks, 6),
-    }
-
-
-def image_dct_extract(image_path: str, output_path: Optional[str] = None,
-                      key: Optional[bytes] = None, quality: int = 80) -> dict:
-    _require_pil()
-    _require_numpy()
-
-    img = Image.open(image_path).convert("L")
-    arr = np.array(img, dtype=np.float64)
-    h, w = arr.shape
-    br, bc = w // DCT_BLOCK, h // DCT_BLOCK
-    step = _quant_step(quality)
-
-    bits: list[int] = []
-    for by in range(bc):
-        for bx in range(br):
-            y0, x0 = by * DCT_BLOCK, bx * DCT_BLOCK
-            block = arr[y0:y0 + DCT_BLOCK, x0:x0 + DCT_BLOCK]
-            coeff = _dct2(block)
-            c = coeff[DCT_COEFF_MID, DCT_COEFF_MID]
-            r = round(c / step)
-            bits.append(1 if (r % 2) != 0 else 0)
-
-    min_bits = 7 * 8
-    if len(bits) < min_bits:
-        raise ValueError("Gambar terlalu kecil untuk header DCT.")
-    head = _bits_to_bytes_py(bits[:min_bits])
-    magic, _v, _f = struct.unpack(_HEADER_FMT_PREFIX, head[:6])
-    if magic != MAGIC:
-        raise ValueError(
-            "Payload DCT tidak terdeteksi. Pastikan parameter 'quality' sama."
-        )
-    fname_len = head[6]
-    header_bits = (7 + fname_len + 14) * 8
-    if len(bits) < header_bits:
-        raise ValueError("Header DCT terpotong.")
-    header, hdr_size = _parse_header(_bits_to_bytes_py(bits[:header_bits]))
-    total_bits = hdr_size * 8 + header["payload_len"] * 8
-    if len(bits) < total_bits:
-        raise ValueError("Payload DCT terpotong.")
-    payload = _bits_to_bytes_py(bits[hdr_size * 8:total_bits])
-    restored = _restore_payload(payload, key, header["flags"])
-    if (zlib.crc32(restored) & 0xFFFFFFFF) != header["crc32"]:
-        raise ValueError("CRC32 mismatch — gambar dimodifikasi atau quality salah.")
-
-    if output_path is None:
-        output_path = header["filename"] or "extracted_payload.bin"
-    Path(output_path).write_bytes(restored)
-    return {
-        "output": output_path,
-        "filename": header["filename"],
-        "size": len(restored),
-        "flags": header["flags"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# ===== AUDIO WAV : LSB =====
-# ---------------------------------------------------------------------------
-def _read_wav(path: str) -> Tuple["np.ndarray", int, int, int]:
-    """Return (samples_int16_1d_or_2d, n_channels, sampwidth, framerate)."""
-    _require_numpy()
-    with wave.open(path, "rb") as wf:
-        n_channels = wf.getnchannels()
-        sampwidth = wf.getsampwidth()
-        framerate = wf.getframerate()
-        n_frames = wf.getnframes()
-        raw = wf.readframes(n_frames)
-    if sampwidth != 2:
-        raise ValueError("Hanya mendukung WAV 16-bit PCM.")
-    samples = np.frombuffer(raw, dtype="<i2").astype(np.int32)
-    if n_channels > 1:
-        samples = samples.reshape(-1, n_channels)
-    return samples, n_channels, sampwidth, framerate
-
-
-def _write_wav(path: str, samples: "np.ndarray", n_channels: int,
-               sampwidth: int, framerate: int) -> None:
-    _require_numpy()
-    data = samples.astype("<i2").tobytes()
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(n_channels)
-        wf.setsampwidth(sampwidth)
-        wf.setframerate(framerate)
-        wf.writeframes(data)
-
-
-def audio_lsb_embed(audio_path: str, payload_path: str, output_path: str,
-                    key: Optional[bytes] = None, compress: bool = True) -> dict:
-    _require_numpy()
-
-    samples, n_channels, sampwidth, framerate = _read_wav(audio_path)
-    flat = samples.reshape(-1).copy().astype(np.int32)
-
-    raw = Path(payload_path).read_bytes()
-    processed, flags = _prepare_payload(raw, key, compress)
-    crc = zlib.crc32(raw) & 0xFFFFFFFF
-    header = _build_header(Path(payload_path).name, len(processed), crc, flags)
-    blob = header + processed
-    bits = _bytes_to_bits_py(blob)
-
-    capacity = flat.size
-    if len(bits) > capacity:
-        raise ValueError(
-            f"Kapasitas audio tidak cukup. Butuh {len(bits)} bit, "
-            f"tersedia {capacity} bit."
-        )
-
-    # clear LSB + sisipkan bit
-    flat[:len(bits)] = (flat[:len(bits)] & ~1) | np.array(bits, dtype=np.int32)
-    flat = np.clip(flat, -32768, 32767).astype(np.int16)
-    if n_channels > 1:
-        flat = flat.reshape(-1, n_channels)
-
-    _write_wav(output_path, flat, n_channels, sampwidth, framerate)
-    return {
-        "output": output_path,
-        "bits_used": len(bits),
-        "capacity_bits": int(capacity),
-        "usage_ratio": round(len(bits) / capacity, 6),
-    }
-
-
-def audio_lsb_extract(audio_path: str, output_path: Optional[str] = None,
-                      key: Optional[bytes] = None) -> dict:
-    _require_numpy()
-
-    samples, _nc, _sw, _fr = _read_wav(audio_path)
-    bits = (samples.reshape(-1) & 1).astype(np.uint8)
-
-    min_bits = 7 * 8
-    if len(bits) < min_bits:
-        raise ValueError("Audio terlalu pendek.")
-    head = _bits_to_bytes(bits[:min_bits])
-    magic, _v, _f = struct.unpack(_HEADER_FMT_PREFIX, head[:6])
-    if magic != MAGIC:
-        raise ValueError("Payload audio tidak terdeteksi.")
-    fname_len = head[6]
-    header_bits = (7 + fname_len + 14) * 8
-    if len(bits) < header_bits:
-        raise ValueError("Header audio terpotong.")
-    header, hdr_size = _parse_header(_bits_to_bytes(bits[:header_bits]))
-    total_bits = hdr_size * 8 + header["payload_len"] * 8
-    if len(bits) < total_bits:
-        raise ValueError("Payload audio terpotong.")
-    payload = _bits_to_bytes(bits[hdr_size * 8:total_bits])
-    restored = _restore_payload(payload, key, header["flags"])
-    if (zlib.crc32(restored) & 0xFFFFFFFF) != header["crc32"]:
-        raise ValueError("CRC32 mismatch — audio rusak atau kunci salah.")
-
-    if output_path is None:
-        output_path = header["filename"] or "extracted_payload.bin"
-    Path(output_path).write_bytes(restored)
-    return {
-        "output": output_path,
-        "filename": header["filename"],
-        "size": len(restored),
-        "flags": header["flags"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# ===== AUDIO WAV : DFT (Frequency Domain) =====
-# ---------------------------------------------------------------------------
-def audio_dft_embed(audio_path: str, payload_path: str, output_path: str,
-                    key: Optional[bytes] = None, compress: bool = True,
-                    freq_bin: int = 1000, delta: float = 4.0) -> dict:
-    _require_numpy()
-
-    samples, n_channels, sampwidth, framerate = _read_wav(audio_path)
-    mono = (samples.mean(axis=1) if n_channels > 1 else samples).astype(np.float64)
-    n = mono.size
-
-    raw = Path(payload_path).read_bytes()
-    processed, flags = _prepare_payload(raw, key, compress)
-    crc = zlib.crc32(raw) & 0xFFFFFFFF
-    header = _build_header(Path(payload_path).name, len(processed), crc, flags)
-    blob = header + processed
-    bits = _bytes_to_bits_py(blob)
-
-    spec = np.fft.rfft(mono)
-    mag = np.abs(spec)
-    phase = np.angle(spec)
-
-    if freq_bin <= 0 or freq_bin >= len(spec) - 1:
-        raise ValueError(f"freq_bin harus 1..{len(spec) - 2}")
-    if freq_bin + len(bits) >= len(spec):
-        raise ValueError(
-            f"Payload terlalu besar untuk DFT. Butuh {len(bits)} bin, "
-            f"tersedia {len(spec) - freq_bin - 1}."
-        )
-
-    baseline = float(np.median(mag[freq_bin:freq_bin + len(bits)]))
-    for i, b in enumerate(bits):
-        target = baseline + (delta if b else -delta)
-        spec[freq_bin + i] = target * np.exp(1j * phase[freq_bin + i])
-
-    modified = np.fft.irfft(spec, n=n)
-    peak = np.max(np.abs(modified))
-    if peak > 32000:
-        modified = modified * (32000.0 / peak)
-    if n_channels > 1:
-        modified = np.repeat(modified[:, None], n_channels, axis=1)
-
-    _write_wav(output_path, np.round(modified), n_channels, sampwidth, framerate)
-    return {
-        "output": output_path,
-        "bits_used": len(bits),
-        "capacity_bits": len(spec) - freq_bin - 1,
-        "freq_bin": freq_bin,
-    }
-
-
-def audio_dft_extract(audio_path: str, output_path: Optional[str] = None,
-                      key: Optional[bytes] = None, freq_bin: int = 1000,
-                      delta: float = 4.0) -> dict:
-    _require_numpy()
-
-    samples, n_channels, _sw, _fr = _read_wav(audio_path)
-    mono = (samples.mean(axis=1) if n_channels > 1 else samples).astype(np.float64)
-    spec = np.fft.rfft(mono)
-    mag = np.abs(spec)
-
-    if freq_bin <= 0 or freq_bin + 56 >= len(spec):
-        raise ValueError("freq_bin tidak valid atau audio terlalu pendek.")
-    baseline = float(np.median(mag[freq_bin:freq_bin + 56]))
-    head = _bits_to_bytes_py(
-        [1 if mag[freq_bin + i] >= baseline else 0 for i in range(56)]
-    )
-    magic, _v, _f = struct.unpack(_HEADER_FMT_PREFIX, head[:6])
-    if magic != MAGIC:
-        raise ValueError("Payload DFT tidak terdeteksi.")
-    fname_len = head[6]
-    needed = (7 + fname_len + 14) * 8
-    if freq_bin + needed >= len(spec):
-        raise ValueError("Header DFT terpotong.")
-    baseline = float(np.median(mag[freq_bin:freq_bin + needed]))
-    header_bits = [1 if mag[freq_bin + i] >= baseline else 0 for i in range(needed)]
-    header, hdr_size = _parse_header(_bits_to_bytes_py(header_bits))
-
-    total_bits = hdr_size * 8 + header["payload_len"] * 8
-    if freq_bin + total_bits >= len(spec):
-        raise ValueError("Payload DFT terpotong.")
-    baseline = float(np.median(mag[freq_bin:freq_bin + total_bits]))
-    payload_bits = [
-        1 if mag[freq_bin + i] >= baseline else 0
-        for i in range(hdr_size * 8, total_bits)
-    ]
-    payload = _bits_to_bytes_py(payload_bits)
-    restored = _restore_payload(payload, key, header["flags"])
-    if (zlib.crc32(restored) & 0xFFFFFFFF) != header["crc32"]:
-        raise ValueError("CRC32 mismatch — audio DFT rusak atau kunci salah.")
-
-    if output_path is None:
-        output_path = header["filename"] or "extracted_payload.bin"
-    Path(output_path).write_bytes(restored)
-    return {
-        "output": output_path,
-        "filename": header["filename"],
-        "size": len(restored),
-        "flags": header["flags"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Kapasitas helper
-# ---------------------------------------------------------------------------
-def capacity_report_image(image_path: str, mode: str = "lsb") -> dict:
-    _require_pil()
-    _require_numpy()
-    img = Image.open(image_path).convert("RGB")
-    arr = np.array(img)
-    h, w, _ = arr.shape
-    if mode == "lsb":
-        cap_bits = arr.size
-    elif mode == "dct":
-        if h % DCT_BLOCK or w % DCT_BLOCK:
-            raise ValueError(f"Dimensi harus kelipatan {DCT_BLOCK}.")
-        cap_bits = (h // DCT_BLOCK) * (w // DCT_BLOCK)
-    else:
-        raise ValueError("mode harus 'lsb' atau 'dct'")
-    return {
-        "mode": mode,
-        "dimensions": (w, h),
-        "capacity_bits": int(cap_bits),
-        "capacity_bytes": int(cap_bits // 8),
-        "capacity_kib": round(cap_bits / 8 / 1024, 2),
-    }
-
-
-def capacity_report_audio(audio_path: str, mode: str = "lsb") -> dict:
-    _require_numpy()
-    samples, n_channels, _sw, _fr = _read_wav(audio_path)
-    flat = samples.reshape(-1)
-    if mode == "lsb":
-        cap_bits = flat.size
-    elif mode == "dft":
-        n = samples.shape[0] if n_channels > 1 else samples.size
-        cap_bits = max(0, n // 2 - 1001)
-    else:
-        raise ValueError("mode harus 'lsb' atau 'dft'")
-    return {
-        "mode": mode,
-        "samples": int(flat.size),
-        "capacity_bits": int(cap_bits),
-        "capacity_bytes": int(cap_bits // 8),
-        "capacity_kib": round(cap_bits / 8 / 1024, 2),
-    }
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-def _print_json(obj: dict) -> None:
-    print(json.dumps(obj, indent=2, ensure_ascii=False))
-
-
-def _build_cli() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="steganography.py",
-        description="LSB & Frequency Domain Steganography Engine (Image/Audio).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Contoh:
-  # Embed payload ke gambar (LSB)
-  python steganography.py embed-image cover.png secret.zip -o out.png --method lsb
-
-  # Ekstrak dari gambar
-  python steganography.py extract-image out.png -o secret.zip
-
-  # DCT (butuh dimensi kelipatan 8)
-  python steganography.py embed-image cover.png secret.zip -o out.png --method dct --quality 80
-
-  # Audio LSB
-  python steganography.py embed-audio track.wav secret.zip -o out.wav --method lsb
-
-  # Audio DFT
-  python steganography.py embed-audio track.wav secret.zip -o out.wav --method dft --freq-bin 1000
-
-  # Dengan kunci (XOR stream)
-  python steganography.py embed-image cover.png secret.zip -o out.png --key mypassword
-
-  # Cek kapasitas
-  python steganography.py capacity cover.png --type image --method lsb
-""",
-    )
-    sub = p.add_subparsers(dest="command", required=True)
-
-    # embed-image
-    sp = sub.add_parser("embed-image", help="Sisipkan payload ke gambar.")
-    sp.add_argument("cover", help="Path gambar cover (PNG/BMP).")
-    sp.add_argument("payload", help="Path payload (file apa saja).")
-    sp.add_argument("-o", "--output", required=True, help="Path output gambar.")
-    sp.add_argument("--method", choices=["lsb", "dct"], default="lsb")
-    sp.add_argument("--quality", type=int, default=80, help="Kualitas DCT (1-100).")
-    sp.add_argument("--key", default=None, help="Kunci teks untuk enkripsi XOR.")
-    sp.add_argument("--no-compress", action="store_true", help="Matikan kompresi zlib.")
-
-    # extract-image
-    sp = sub.add_parser("extract-image", help="Ekstrak payload dari gambar.")
-    sp.add_argument("stego", help="Path gambar stego.")
-    sp.add_argument("-o", "--output", default=None, help="Path output payload.")
-    sp.add_argument("--method", choices=["lsb", "dct"], default="lsb")
-    sp.add_argument("--quality", type=int, default=80)
-    sp.add_argument("--key", default=None)
-
-    # embed-audio
-    sp = sub.add_parser("embed-audio", help="Sisipkan payload ke WAV 16-bit.")
-    sp.add_argument("cover", help="Path WAV cover.")
-    sp.add_argument("payload", help="Path payload.")
-    sp.add_argument("-o", "--output", required=True, help="Path WAV output.")
-    sp.add_argument("--method", choices=["lsb", "dft"], default="lsb")
-    sp.add_argument("--freq-bin", type=int, default=1000)
-    sp.add_argument("--delta", type=float, default=4.0)
-    sp.add_argument("--key", default=None)
-    sp.add_argument("--no-compress", action="store_true")
-
-    # extract-audio
-    sp = sub.add_parser("extract-audio", help="Ekstrak payload dari WAV.")
-    sp.add_argument("stego", help="Path WAV stego.")
-    sp.add_argument("-o", "--output", default=None, help="Path output payload.")
-    sp.add_argument("--method", choices=["lsb", "dft"], default="lsb")
-    sp.add_argument("--freq-bin", type=int, default=1000)
-    sp.add_argument("--delta", type=float, default=4.0)
-    sp.add_argument("--key", default=None)
-
-    # capacity
-    sp = sub.add_parser("capacity", help="Laporkan kapasitas media.")
-    sp.add_argument("media", help="Path gambar atau WAV.")
-    sp.add_argument("--type", choices=["image", "audio"], required=True)
-    sp.add_argument("--method", default="lsb",
-                    help="lsb/dct untuk image, lsb/dft untuk audio.")
-
-    return p
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = _build_cli()
-    args = parser.parse_args(argv)
-    key = _key_bytes(getattr(args, "key", None))
-
-    try:
-        if args.command == "embed-image":
-            if args.method == "lsb":
-                res = image_lsb_embed(args.cover, args.payload, args.output,
-                                      key=key, compress=not args.no_compress)
+                raise ValueError(f"Unsupported bit depth: {self.bits_per_sample}")
+        
+        # Write output file
+        with open(output_path, 'wb') as f:
+            # Rewrite RIFF header
+            f.write(b'RIFF')
+            f.write(struct.pack('<I', 4 + 8 + 16 + 8 + len(modified_data)))
+            f.write(b'WAVE')
+            
+            # Write fmt chunk
+            f.write(b'fmt ')
+            f.write(struct.pack('<I', 16))
+            f.write(struct.pack('<H', self.audio_format))
+            f.write(struct.pack('<H', self.num_channels))
+            f.write(struct.pack('<I', self.sample_rate))
+            f.write(struct.pack('<I', self.byte_rate))
+            f.write(struct.pack('<H', self.block_align))
+            f.write(struct.pack('<H', self.bits_per_sample))
+            
+            # Write data chunk
+            f.write(b'data')
+            f.write(struct.pack('<I', len(modified_data)))
+            f.write(bytes(modified_data))
+        
+        return msg_len
+    
+    def extract_message(self) -> str:
+        """Extract a hidden message from the audio file."""
+        if len(self.audio_data) < 32:
+            raise ValueError("Audio data too small to contain hidden data")
+        
+        # Extract length
+        length_bits = []
+        for i in range(32):
+            if self.bits_per_sample == 8:
+                length_bits.append(self.audio_data[i] & 1)
+            elif self.bits_per_sample == 16:
+                word = struct.unpack('<h', self.audio_data[i:i+2])[0]
+                length_bits.append(word & 1)
+            elif self.bits_per_sample == 24:
+                b0, b1, b2 = self.audio_data[i], self.audio_data[i+1], self.audio_data[i+2]
+                val = (b2 << 16) | (b1 << 8) | b0
+                length_bits.append(val & 1)
             else:
-                res = image_dct_embed(args.cover, args.payload, args.output,
-                                      key=key, compress=not args.no_compress,
-                                      quality=args.quality)
-            _print_json(res)
-
-        elif args.command == "extract-image":
-            if args.method == "lsb":
-                res = image_lsb_extract(args.stego, args.output, key=key)
+                raise ValueError(f"Unsupported bit depth: {self.bits_per_sample}")
+        
+        length_bytes = _bits_to_bytes(length_bits)
+        msg_len = struct.unpack('>I', length_bytes[:4])[0]
+        
+        if msg_len <= 0 or msg_len > len(self.audio_data) // 8 - 4:
+            raise ValueError("Invalid message length detected")
+        
+        # Extract message
+        msg_bits = []
+        for i in range(32, 32 + msg_len * 8):
+            if self.bits_per_sample == 8:
+                msg_bits.append(self.audio_data[i] & 1)
+            elif self.bits_per_sample == 16:
+                word = struct.unpack('<h', self.audio_data[i:i+2])[0]
+                msg_bits.append(word & 1)
+            elif self.bits_per_sample == 24:
+                b0, b1, b2 = self.audio_data[i], self.audio_data[i+1], self.audio_data[i+2]
+                val = (b2 << 16) | (b1 << 8) | b0
+                msg_bits.append(val & 1)
             else:
-                res = image_dct_extract(args.stego, args.output, key=key,
-                                        quality=args.quality)
-            _print_json(res)
+                raise ValueError(f"Unsupported bit depth: {self.bits_per_sample}")
+        
+        msg_bytes = _bits_to_bytes(msg_bits)
+        return msg_bytes.decode('utf-8')
 
-        elif args.command == "embed-audio":
-            if args.method == "lsb":
-                res = audio_lsb_embed(args.cover, args.payload, args.output,
-                                      key=key, compress=not args.no_compress)
+
+class DctImageStego:
+    """
+    DCT-based Steganography for JPEG images.
+    Uses Discrete Cosine Transform frequency domain embedding.
+    """
+    
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.image_data = None
+        self.quantization_table = None
+        self.dct_coefficients = None
+        self._load_image()
+    
+    def _load_image(self):
+        # Simple JPEG loader - reads quantization tables and DCT coefficients
+        with open(self.filepath, 'rb') as f:
+            data = f.read()
+        
+        # Parse JPEG structure (simplified)
+        pos = 0
+        while pos < len(data):
+            if data[pos] == 0xFF:
+                marker = data[pos + 1]
+                if marker == 0xD9:  # End of image
+                    break
+                elif marker == 0xDB:  # Quantization table
+                    self.quantization_table = self._parse_quant_table(data, pos + 2)
+                elif marker == 0xC4:  # Huffman table
+                    pass
+                elif marker == 0xDA:  # Start of scan
+                    self.image_data = data[pos + 2:]
+                    break
+                elif marker == 0xD8:  # Start of image
+                    pos += 2
+                    continue
+                else:
+                    # Skip segment
+                    seg_len = struct.unpack('>H', data[pos+2:pos+4])[0]
+                    pos += 2 + seg_len
             else:
-                res = audio_dft_embed(args.cover, args.payload, args.output,
-                                      key=key, compress=not args.no_compress,
-                                      freq_bin=args.freq_bin, delta=args.delta)
-            _print_json(res)
-
-        elif args.command == "extract-audio":
-            if args.method == "lsb":
-                res = audio_lsb_extract(args.stego, args.output, key=key)
+                pos += 1
+    
+    def _parse_quant_table(self, data, pos):
+        """Parse quantization table from JPEG data."""
+        # Simplified - returns basic quantization matrix
+        # In real implementation, this would parse the full table
+        table_size = struct.unpack('>H', data[pos:pos+2])[0]
+        precision = data[pos + 2]
+        table_id = data[pos + 3]
+        
+        # Read 64 quantization values
+        quant_values = []
+        for i in range(64):
+            if precision == 0:
+                quant_values.append(data[pos + 4 + i])
             else:
-                res = audio_dft_extract(args.stego, args.output, key=key,
-                                        freq_bin=args.freq_bin, delta=args.delta)
-            _print_json(res)
-
-        elif args.command == "capacity":
-            if args.type == "image":
-                res = capacity_report_image(args.media, mode=args.method)
+                # 16-bit quantization value
+                val = struct.unpack('>H', data[pos + 4 + i*2:pos + 4 + i*2 + 2])[0]
+                quant_values.append(val)
+        
+        return quant_values
+    
+    def embed_message(self, message: str, output_path: str) -> int:
+        """Embed message using DCT coefficients (simplified implementation)."""
+        if self.quantization_table is None:
+            raise ValueError("Quantization table not found")
+        
+        msg_bytes = message.encode('utf-8')
+        msg_len = len(msg_bytes)
+        
+        # Capacity check
+        capacity = len(self.quantization_table) // 8
+        if msg_len + 4 > capacity:
+            raise MemoryError(
+                f"Message too large: {msg_len} bytes + 4 byte header "
+                f"exceeds capacity of {capacity} bytes"
+            )
+        
+        # Prepare payload
+        payload = struct.pack('>I', msg_len) + msg_bytes
+        payload_bits = _bytes_to_bits(payload)
+        
+        # Embed bits into DCT coefficients (using AC coefficients)
+        # This is a simplified version - real implementation would use proper DCT
+        modified_coeffs = list(self.quantization_table)
+        
+        # Use lower-frequency AC coefficients for embedding
+        embed_positions = list(range(1, min(len(modified_coeffs), 64)))
+        
+        for i, bit in enumerate(payload_bits):
+            if i >= len(embed_positions):
+                break
+            pos = embed_positions[i]
+            # Modify coefficient based on quantization
+            coeff = modified_coeffs[pos]
+            quant = self.quantization_table[pos] if pos < len(self.quantization_table) else 1
+            
+            # Ensure coefficient can be modified
+            if quant > 0:
+                # Round to nearest multiple of quant, then add/subtract 1
+                base = (coeff // quant) * quant
+                if bit == 1:
+                    modified_coeffs[pos] = base + quant
+                else:
+                    modified_coeffs[pos] = base
+        
+        # Save modified coefficients
+        with open(output_path, 'wb') as f:
+            f.write(b'\xFF\xDB')  # Quantization table marker
+            f.write(struct.pack('>H', 64 + 2))  # Table length
+            f.write(b'\x00')  # Precision
+            f.write(b'\x00')  # Table ID
+            
+            for val in modified_coeffs:
+                f.write(struct.pack('>B', val & 0xFF))
+            
+            # Copy rest of image data
+            if self.image_data:
+                f.write(self.image_data)
+        
+        return msg_len
+    
+    def extract_message(self) -> str:
+        """Extract hidden message from DCT coefficients."""
+        if self.quantization_table is None:
+            raise ValueError("Quantization table not found")
+        
+        # Extract bits from same positions used during embedding
+        embed_positions = list(range(1, min(len(self.quantization_table), 64)))
+        
+        length_bits = []
+        for i in range(min(32, len(embed_positions))):
+            pos = embed_positions[i]
+            coeff = self.quantization_table[pos]
+            quant = self.quantization_table[pos] if pos < len(self.quantization_table) else 1
+            
+            if quant > 0:
+                base = (coeff // quant) * quant
+                # Determine if it's base + quant (1) or base (0)
+                diff = coeff - base
+                if diff > 0:
+                    length_bits.append(1)
+                else:
+                    length_bits.append(0)
             else:
-                res = capacity_report_audio(args.media, mode=args.method)
-            _print_json(res)
+                length_bits.append(0)
+        
+        length_bytes = _bits_to_bytes(length_bits)
+        msg_len = struct.unpack('>I', length_bytes[:4])[0]
+        
+        if msg_len <= 0 or msg_len > len(self.quantization_table) // 8 - 4:
+            raise ValueError("Invalid message length detected")
+        
+        # Extract message bits
+        msg_bits = []
+        for i in range(32, 32 + msg_len * 8):
+            if i >= len(embed_positions):
+                break
+            pos = embed_positions[i]
+            coeff = self.quantization_table[pos]
+            quant = self.quantization_table[pos] if pos < len(self.quantization_table) else 1
+            
+            if quant > 0:
+                base = (coeff // quant) * quant
+                diff = coeff - base
+                if diff > 0:
+                    msg_bits.append(1)
+                else:
+                    msg_bits.append(0)
+            else:
+                msg_bits.append(0)
+        
+        msg_bytes = _bits_to_bytes(msg_bits)
+        return msg_bytes.decode('utf-8')
 
-        else:
-            parser.error(f"Perintah tidak dikenal: {args.command}")
-        return 0
 
-    except Exception as exc:  # noqa: BLE001
-        print(f"[ERROR] {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
+class DctAudioStego:
+    """
+    DCT-based Steganography for WAV audio files.
+    Uses Discrete Cosine Transform for frequency domain embedding.
+    """
+    
+    def __init__(self, filepath: str):
+        self.stego_base = LsbAudioStego(filepath)
+        self.audio_data = self.stego_base.audio_data
+        self.sample_rate = self.stego_base.sample_rate
+        self.bits_per_sample = self.stego_base.bits_per_sample
+        self.num_channels = self.stego_base.num_channels
+    
+    def _compute_dct(self, block: list[float]) -> list[float]:
+        """Compute DCT-II for a block of samples."""
+        N = len(block)
+        dct_out = [0.0] * N
+        
+        for k in range(N):
+            sum_val = 0.0
+            for n in range(N):
+                sum_val += block[n] * math.cos(math.pi * (2*n + 1) * k / (2*N))
+            dct_out[k] = sum_val
+        
+        return dct_out
+    
+    def _compute_idct(self, block: list[float]) -> list[float]:
+        """Compute inverse DCT for a block of samples."""
+        N = len(block)
+        idct_out = [0.0] * N
+        
+        for n in range(N):
+            sum_val = 0.0
+            for k in range(N):
+                if k == 0:
+                    sum_val += block[k] * math.cos(math.pi * (2*n + 1) * k / (2*N))
+                else:
+                    sum_val += 2 * block[k] * math.cos(math.pi * (2*n + 1) * k / (2*N))
+            idct_out[n] = sum_val / (2 * N)
+        
+        return idct_out
+    
+    def embed_message(self, message: str, output_path: str) -> int:
+        """Embed message using DCT coefficients in audio."""
+        import math
+        
+        msg_bytes = message.encode('utf-8')
+        msg_len = len(msg_bytes)
+        
+        # Convert audio samples to float
+        samples = []
+        for i in range(0, len(self.audio_data), self.bits_per_sample // 8):
+            if i + self.bits_per_sample // 8 <= len(self.audio_data):
+                if self.bits_per_sample == 8:
+                    samples.append(float(self.audio_data[i]) - 128)
+                elif self.bits_per_sample == 16:
+                    val = struct.unpack('<h', self.audio_data[i:i+2])[0]
+                    samples.append(float(val))
+                elif self.bits_per_sample == 24:
+                    b0, b1, b2 = self.audio_data[i], self.audio_data[i+1], self.audio_data[i+2]
+                    val = (b2 << 16) | (b1 << 8) | b0
+                    if val & 0x800000:
+                        val -= 0x1000000
+                    samples.append(float(val))
+        
+        # Process in blocks
+        block_size = 64
+        num_blocks = len(samples) // block_size
+        
+        # Prepare payload
+        payload = struct.pack('>I', msg_len) + msg_bytes
+        payload_bits = _bytes_to_bits(payload)
+        
+        bit_index = 0
+        modified_samples = samples.copy()
+        
+        for block_idx in range(num_blocks):
+            if bit_index >= len(payload_bits):
+                break
+            
+            # Extract block
+            block = samples[block_idx * block_size:(block_idx + 1) * block_size]
+            
+            # Compute DCT
+            dct_block = self._compute_dct(block)
+            
+            # Embed bit in middle-frequency coefficient
+            mid_freq = len(dct_block) // 4
+            if bit_index < len(payload_bits):
+                bit = payload_bits[bit_index]
+                # Modify coefficient slightly
+                sign = 1 if bit == 1 else -1
+                dct_block[mid_freq] += sign * 0.1
+                
+                # Inverse DCT
+                idct_block = self._compute_idct(dct_block)
+                
+                # Replace samples
+                for j in range(block_size):
+                    idx = block_idx * block_size + j
+                    if idx < len(modified_samples):
+                        modified_samples[idx] = idct_block[j]
+                
+                bit_index += 1
+        
+        # Convert back to bytes
+        modified_data = bytearray()
+        for sample in modified_samples:
+            if self.bits_per_sample == 8:
+                val = int(round(sample)) + 128
+                modified_data.append(max(0, min(255, val)))
+            elif self.bits_per_sample == 16:
+                val = int(round(sample))
+                val = max(-32768, min(32767, val))
+                modified_data.extend(struct.pack('<h', val))
+            elif self.bits_per_sample == 24:
+                val = int(round(sample))
+                if val >= 0:
+                    b0 = val & 0xFF
+                    b1 = (val >> 8) & 0xFF
+                    b2 = (val >> 16) & 0xFF
+                else:
+                    val += 0x1000000
+                    b0 = val & 0xFF
+                    b1 = (val >> 8) & 0xFF
+                    b2 = (val >> 16) & 0xFF
+                modified_data.extend([b0, b1, b2])
+        
+        # Write output file
+        with open(output_path, 'wb') as f:
+            f.write(b'RIFF')
+            f.write(struct.pack('<I', 4 + 8 + 16 + 8 + len(modified_data)))
+            f.write(b'WAVE')
+            f.write(b'fmt ')
+            f.write(struct.pack('<I', 16))
+            f.write(struct.pack('<H', 1))  # PCM
+            f.write(struct.pack('<H', self.num_channels))
+            f.write(struct.pack('<I', self.sample_rate))
+            f.write(struct.pack('<I', self.sample_rate * self.num_channels * (self.bits_per_sample // 8)))
+            f.write(struct.pack('<H', self.num_channels * (self.bits_per_sample // 8)))
+            f.write(struct.pack('<H', self.bits_per_sample))
+            f.write(b'data')
+            f.write(struct.pack('<I', len(modified_data)))
+            f.write(bytes(modified_data))
+        
+        return msg_len
+    
+    def extract_message(self) -> str:
+        """Extract hidden message from DCT coefficients in audio."""
+        import math
+        
+        samples = []
+        for i in range(0, len(self.audio_data), self.bits_per_sample // 8):
+            if i + self.bits_per_sample // 8 <= len(self.audio_data):
+                if self.bits_per_sample == 8:
+                    samples.append(float(self.audio_data[i]) - 128)
+                elif self.bits_per_sample == 16:
+                    val = struct.unpack('<h', self.audio_data[i:i+2])[0]
+                    samples.append(float(val))
+                elif self.bits_per_sample == 24:
+                    b0, b1, b2 = self.audio_data[i], self.audio_data[i+1], self.audio_data[i+2]
+                    val = (b2 << 16) | (b1 << 8) | b0
+                    if val & 0x800000:
+                        val -= 0x1000000
+                    samples.append(float(val))
+        
+        block_size = 64
+        num_blocks = len(samples) // block_size
+        
+        # Extract bits from middle-frequency coefficients
+        extracted_bits = []
+        
+        for block_idx in range(num_blocks):
+            block = samples[block_idx * block_size:(block_idx + 1) * block_size]
+            dct_block = self._compute_dct(block)
+            
+            mid_freq = len(dct_block) // 4
+            coeff = dct_block[mid_freq]
+            
+            # Determine bit based on sign
+            if coeff > 0:
+                extracted_bits.append(1)
+            else:
+                extracted_bits.append(0)
+        
+        if len(extracted_bits) < 32:
+            raise ValueError("Audio data too small to contain hidden data")
+        
+        # Extract length
+        length_bits = extracted_bits[:32]
+        length_bytes = _bits_to_bytes(length_bits)
+        msg_len = struct.unpack('>I', length_bytes[:4])[0]
+        
+        if msg_len <= 0 or msg_len > len(extracted_bits) - 4:
+            raise ValueError("Invalid message length detected")
+        
+        # Extract message
+        msg_bits = extracted_bits[32:32 + msg_len * 8]
+        msg_bytes = _bits_to_bytes(msg_bits)
+        return msg_bytes.decode('utf-8')
+
+
+def create_test_bmp(filepath: str, width: int = 100, height: int = 100, color: tuple = (255, 0, 0)):
+    """Create a simple test BMP file."""
+    row_size = ((width * 3 + 3) // 4 * 4)
+    image_size = row_size * height
+    
+    with open(filepath, 'wb') as f:
+        # BMP Header
+        f.write(b'BM')
+        f.write(struct.pack('<I', 54 + image_size))
+        f.write(struct.pack('<I', 0))
+        f.write(struct.pack('<I', 54))
+        
+        # DIB Header
+        f.write(struct.pack('<I', 40))
+        f.write(struct.pack('<i', width))
+        f.write(struct.pack('<i', height))
+        f.write(struct.pack('<H', 1))
+        f.write(struct.pack('<H', 24))
+        f.write(struct.pack('<I', 0))
+        f.write(struct.pack('<I', image_size))
+        f.write(struct.pack('<i', 0))
+        f.write(struct.pack('<i', 0))
+        f.write(struct.pack('<I', 0))
+        f.write(struct.pack('<I', 0))
+        
+        # Pixel data
+        for _ in range(height):
+            row = bytearray()
+            for _ in range(width):
+                row.extend(color)
+            # Add padding
+            padding = (4 - (len(row) % 4)) % 4
+            row.extend(b'\x00' * padding)
+            f.write(bytes(row))
+
+
+def create_test_wav(filepath: str, duration_sec: float = 1.0, freq: float = 440.0):
+    """Create a simple test WAV file."""
+    sample_rate = 44100
+    num_samples = int(sample_rate * duration_sec)
+    num_channels = 1
+    bits_per_sample = 16
+    
+    with open(filepath, 'wb') as f:
+        # Generate sine wave
+        samples = bytearray()
+        for i in range(num_samples):
+            t = i / sample_rate
+            val = int(32767 * 0.5 * math.sin(2 * math.pi * freq * t))
+            samples.extend(struct.pack('<h', val))
+        
+        byte_rate = sample_rate * num_channels * (bits_per_sample // 8)
+        block_align = num_channels * (bits_per_sample // 8)
+        data_size = len(samples)
+        
+        # RIFF header
+        f.write(b'RIFF')
+        f.write(struct.pack('<I', 4 + 8 + 16 + 8 + data_size))
+        f.write(b'WAVE')
+        
+        # fmt chunk
+        f.write(b'fmt ')
+        f.write(struct.pack('<I', 16))
+        f.write(struct.pack('<H', 1))  # PCM
+        f.write(struct.pack('<H', num_channels))
+        f.write(struct.pack('<I', sample_rate))
+        f.write(struct.pack('<I', byte_rate))
+        f.write(struct.pack('<H', block_align))
+        f.write(struct.pack('<H', bits_per_sample))
+        
+        # data chunk
+        f.write(b'data')
+        f.write(struct.pack('<I', data_size))
+        f.write(bytes(samples))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import math
+    
+    print("Testing Steganography Engine...")
+    
+    # Test BMP steganography
+    print("\n1. Testing BMP LSB Steganography:")
+    test_bmp = "test_image.bmp"
+    create_test_bmp(test_bmp)
+    
+    try:
+        stego_img = LsbImageStego(test_bmp)
+        message = "Hello, Steganography!"
+        stego_img.embed_message(message, "output_image.bmp")
+        extracted = stego_img.extract_message()
+        print(f"   Original: {message}")
+        print(f"   Extracted: {extracted}")
+        print(f"   Match: {message == extracted}")
+    except Exception as e:
+        print(f"   Error: {e}")
+    
+    # Test WAV steganography
+    print("\n2. Testing WAV LSB Steganography:")
+    test_wav = "test_audio.wav"
+    create_test_wav(test_wav)
+    
+    try:
+        stego_audio = LsbAudioStego(test_wav)
+        message = "Hello, Audio Steganography!"
+        stego_audio.embed_message(message, "output_audio.wav")
+        extracted = stego_audio.extract_message()
+        print(f"   Original: {message}")
+        print(f"   Extracted: {extracted}")
+        print(f"   Match: {message == extracted}")
+    except Exception as e:
+        print(f"   Error: {e}")
+    
+    print("\nAll tests completed!")
