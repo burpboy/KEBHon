@@ -1,103 +1,226 @@
 import hashlib
 import json
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-
-class ImmutableLogBlock:
-    """Mewakili satu blok/entri dalam log eksekusi immutable."""
-
-    def __init__(self, index: int, previous_hash: str, data: Dict[str, Any]) -> None:
-        self.index: int = index
-        self.timestamp: str = datetime.utcnow().isoformat()
-        self.previous_hash: str = previous_hash
-        self.data: Dict[str, Any] = data
-        self.nonce: int = 0
-        self.hash: str = self.calculate_hash()
-
-    def calculate_hash(self) -> str:
-        """Menghitung SHA-256 hash berdasarkan isi blok."""
-        block_content = {
-            "index": self.index,
-            "timestamp": self.timestamp,
-            "previous_hash": self.previous_hash,
-            "data": self.data,
-            "nonce": self.nonce,
-        }
-        encoded_block = json.dumps(block_content, sort_keys=True).encode("utf-8")
-        return hashlib.sha256(encoded_block).hexdigest()
-
+import os
+import time
+import fcntl
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
 
 class AuditLog:
-    """Mengelola rantai log eksekusi yang aman dan tidak dapat diubah (immutable)."""
+    """
+    Immutable Execution Log with Cryptographic Hashing.
+    
+    Ensures integrity by chaining hashes. If any previous record is modified,
+    the hash of that record changes, causing all subsequent records to become invalid.
+    """
+    
+    def __init__(self, filepath: str = "audit.log"):
+        self.filepath = filepath
+        self.lock_file = f"{filepath}.lock"
+        
+        # Initialize file if it doesn't exist
+        if not os.path.exists(self.filepath):
+            self._write_log_entry({
+                "id": 0,
+                "timestamp": self._get_iso_timestamp(),
+                "action": "INIT",
+                "data": {},
+                "prev_hash": "genesis",
+                "record_hash": None # Will be calculated
+            })
 
-    def __init__(self) -> None:
-        self._chain: List[ImmutableLogBlock] = []
-        self._initialize_genesis_block()
+    def _get_iso_timestamp(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
 
-    def _initialize_genesis_block(self) -> None:
-        """Membuat blok pertama (genesis block) untuk memulai rantai log."""
-        genesis_data = {"event": "SYSTEM_INITIALIZED", "actor": "SYSTEM"}
-        genesis_block = ImmutableLogBlock(
-            index=0, previous_hash="0" * 64, data=genesis_data
-        )
-        self._chain.append(genesis_block)
+    def _calculate_sha256(self, data: dict) -> str:
+        """Calculates a deterministic SHA-256 hash for a specific log entry."""
+        # Sort keys to ensure consistent hashing regardless of dictionary order
+        string_data = json.dumps(data, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(string_data.encode('utf-8')).hexdigest()
 
-    def record_execution(self, execution_data: Dict[str, Any]) -> ImmutableLogBlock:
-        """Merekam eksekusi baru ke dalam log dengan mengikat hash sebelumnya."""
-        if not isinstance(execution_data, dict):
-            raise TypeError("Data eksekusi harus berupa dictionary.")
+    def _get_last_record(self) -> Optional[dict]:
+        """Reads the last line from the log file safely."""
+        try:
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                if not lines:
+                    return None
+                last_line = lines[-1].strip()
+                if not last_line:
+                    return None
+                return json.loads(last_line)
+        except (FileNotFoundError, json.JSONDecodeError, IndexError):
+            return None
 
-        previous_block = self._chain[-1]
-        new_block = ImmutableLogBlock(
-            index=previous_block.index + 1,
-            previous_hash=previous_block.hash,
-            data=execution_data,
-        )
-        self._chain.append(new_block)
-        return new_block
+    def _verify_integrity(self, check_from_index: int = -1) -> bool:
+        """
+        Verifies the integrity of the log file.
+        Returns True if all hashes match their expected values.
+        """
+        try:
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            if not lines:
+                return True
 
-    def verify_integrity(self) -> bool:
-        """Memeriksa integritas seluruh rantai log dari manipulasi."""
-        for i in range(1, len(self._chain)):
-            current_block = self._chain[i]
-            previous_block = self._chain[i - 1]
+            # Start verification from the end or specified index
+            start_idx = max(0, len(lines) + check_from_index) if check_from_index < 0 else check_from_index
+            
+            current_prev_hash = "genesis"
+            if start_idx > 0:
+                # We need the hash of the record before the start_idx to verify continuity
+                # But for simplicity in this O(n) check, we just re-hash everything or 
+                # assume the user wants to check the whole file integrity.
+                # Let's do a full verification for absolute safety.
+                current_prev_hash = "genesis"
+                start_idx = 0
 
-            # Verifikasi apakah hash saat ini cocok dengan isinya
-            if current_block.hash != current_block.calculate_hash():
-                return False
+            for i in range(start_idx, len(lines)):
+                line = lines[i].strip()
+                if not line:
+                    continue
+                
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    print(f"[ERROR] Invalid JSON at line {i}")
+                    return False
 
-            # Verifikasi apakah tautan ke blok sebelumnya valid
-            if current_block.previous_hash != previous_block.hash:
-                return False
+                expected_prev_hash = record.get("prev_hash")
+                if expected_prev_hash != current_prev_hash:
+                    print(f"[INTEGRITY FAILURE] Mismatch at line {i}. Expected prev_hash: {current_prev_hash}, Got: {expected_prev_hash}")
+                    return False
 
-        return True
+                # Calculate current record hash
+                # Note: The record_hash field itself should NOT be included in its own calculation
+                # To avoid circular dependency. We remove it temporarily.
+                record_copy = record.copy()
+                del record_copy["record_hash"]
+                calculated_hash = self._calculate_sha256(record_copy)
+                
+                actual_hash = record.get("record_hash")
+                if actual_hash != calculated_hash:
+                    print(f"[INTEGRITY FAILURE] Corrupted record at line {i}")
+                    return False
 
-    def get_logs(self) -> List[Dict[str, Any]]:
-        """Mengembalikan salinan seluruh entri log."""
-        return [
-            {
-                "index": block.index,
-                "timestamp": block.timestamp,
-                "previous_hash": block.previous_hash,
-                "hash": block.hash,
-                "data": block.data,
-            }
-            for block in self._chain
-        ]
+                current_prev_hash = calculated_hash
 
+            return True
 
-# Contoh Penggunaan
+        except FileNotFoundError:
+            return True
+
+    def _write_log_entry(self, record: dict, append: bool = True):
+        """Writes a single record to the log file atomically."""
+        # 1. Prepare the record
+        record["timestamp"] = self._get_iso_timestamp()
+        
+        # Get previous hash
+        last_record = self._get_last_record()
+        prev_hash = last_record["record_hash"] if last_record else "genesis"
+        
+        record["prev_hash"] = prev_hash
+        
+        # Calculate hash of THIS record (excluding the record_hash field itself to avoid recursion)
+        record_for_hash = {k: v for k, v in record.items() if k != "record_hash"}
+        record["record_hash"] = self._calculate_sha256(record_for_hash)
+        
+        # Convert to JSON string
+        log_line = json.dumps(record, sort_keys=False) + "\n"
+        
+        # 2. Atomic Write Process
+        temp_filepath = f"{self.filepath}.tmp"
+        
+        try:
+            # Open file for appending
+            fd = os.open(self.filepath, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                # Acquire lock
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                
+                # Write to temp file first? No, for append-only, we can write directly to end.
+                # But to ensure atomicity of the *file structure*, we rewrite the whole file?
+                # No, that's expensive for large logs.
+                # For Append-Only, we just append. The integrity is maintained by the hash chain.
+                # However, to prevent partial writes if power fails, we use a temp file approach 
+                # only if we were rewriting. Since we are appending, we just ensure the write is complete.
+                
+                os.write(fd, log_line.encode('utf-8'))
+                os.fsync(fd) # Ensure data is written to disk
+                
+            finally:
+                os.close(fd)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                
+        except Exception as e:
+            raise IOError(f"Failed to write audit log: {e}")
+
+    def log_event(self, action: str, data: Optional[Dict[str, Any]] = None, user: Optional[str] = None, ip: Optional[str] = None):
+        """
+        Logs an event into the immutable log.
+        
+        Args:
+            action: Description of the action (e.g., "LOGIN", "DELETE_FILE")
+            data: Dictionary of additional data associated with the event
+            user: User ID performing the action
+            ip: IP address of the user
+        """
+        if data is None:
+            data = {}
+        
+        record = {
+            "id": self._get_next_id(),
+            "action": str(action),
+            "user": str(user) if user else "system",
+            "ip": str(ip) if ip else "unknown",
+            "data": data
+        }
+        
+        self._write_log_entry(record)
+
+    def _get_next_id(self) -> int:
+        """Retrieves the next sequential ID based on the last log entry."""
+        last_record = self._get_last_record()
+        if not last_record:
+            return 1
+        return last_record.get("id", 0) + 1
+
+    def get_logs(self, limit: int = 10) -> List[dict]:
+        """Retrieves the most recent N log entries."""
+        try:
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                # Return last 'limit' lines, skipping empty lines
+                valid_lines = [l.strip() for l in lines if l.strip()]
+                return [json.loads(l) for l in valid_lines[-limit:]]
+        except FileNotFoundError:
+            return []
+
+    def verify(self) -> bool:
+        """Public method to verify the entire log integrity."""
+        return self._verify_integrity()
+
+# --- Example Usage / Demo ---
 if __name__ == "__main__":
-    audit = AuditLog()
-
-    # Merekam beberapa aksi eksekusi
-    audit.record_execution({"action": "USER_LOGIN", "username": "admin", "status": "SUCCESS"})
-    audit.record_execution({"action": "DELETE_RECORD", "table": "users", "record_id": 42})
-
-    # Validasi integritas awal
-    print("Integritas Log Valid:", audit.verify_integrity())
-
-    # Menampilkan hasil log
-    import pprint
-    pprint.pprint(audit.get_logs())
+    # Initialize logger
+    logger = AuditLog(filepath="audit.log")
+    
+    # Clear existing log for demo purposes (optional)
+    if os.path.exists("audit.log"):
+        os.remove("audit.log")
+        
+    # Log some events
+    logger.log_event(action="USER_LOGIN", user="admin_01", ip="192.168.1.10")
+    logger.log_event(action="FILE_ACCESS", user="admin_01", ip="192.168.1.10", data={"file": "/etc/config.yaml"})
+    logger.log_event(action="CONFIG_CHANGE", user="admin_01", ip="192.168.1.10", data={"key": "debug_mode", "old": "false", "new": "true"})
+    logger.log_event(action="USER_LOGOUT", user="admin_01", ip="192.168.1.10")
+    
+    # Verify integrity
+    print(f"Integrity Check: {'PASSED' if logger.verify() else 'FAILED'}")
+    
+    # Display logs
+    print("\n--- Recent Logs ---")
+    logs = logger.get_logs(limit=5)
+    for log in logs:
+        print(json.dumps(log, indent=2))
