@@ -1,5 +1,7 @@
 KEBHon
 
+Tools by Karanganyar Elite BH
+
 Platform deteksi dan respons ancaman siber terintegrasi — dari ingestion telemetri hingga orchestration respons otomatis.
 
 KEBHon adalah kerangka kerja keamanan siber modular yang menggabungkan pengumpulan data telemetri keamanan, analisis perilaku berbasis ML, agregasi threat intelligence, dan otomatisasi respons (SOAR) dalam satu alur pipeline.
