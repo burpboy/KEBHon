@@ -286,7 +286,29 @@ class DashboardApp(App):
     def action_quit(self):
         self.exit()
 
+class TasksScreen(Screen):
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Halaman Tasks (Dummy)")
+        yield Footer()
 
+class SystemMonitorScreen(Screen):
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Halaman Monitor (Dummy)")
+        yield Footer()
+
+class LogsScreen(Screen):
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Halaman Logs (Dummy)")
+        yield Footer()
+
+class SettingsScreen(Screen):
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Halaman Settings (Dummy)")
+        yield Footer()
 if __name__ == "__main__":
     # Run the app
     app = DashboardApp()
