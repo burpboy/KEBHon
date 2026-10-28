@@ -1,0 +1,30 @@
+{
+  "version": "1.0",
+  "generated_at": "2026-10-28T10:00:00Z",
+  "files": [
+    {
+      "filename": "tcpdump_session_01.pcap",
+      "description": "General TCP session including SYN, ACK, Data, and FIN.",
+      "protocol": "TCP",
+      "size_bytes": 150
+    },
+    {
+      "filename": "http_get_request.pcap",
+      "description": "Single HTTP GET request to example.com.",
+      "protocol": "HTTP/1.1",
+      "size_bytes": 120
+    },
+    {
+      "filename": "tls_handshake.pcap",
+      "description": "TLS ClientHello and ServerHello handshake simulation.",
+      "protocol": "TLS 1.3",
+      "size_bytes": 250
+    },
+    {
+      "filename": "corrupted_packet.pcap",
+      "description": "Packet with invalid checksum and truncated payload.",
+      "protocol": "TCP/IP",
+      "size_bytes": 60
+    }
+  ]
+}
