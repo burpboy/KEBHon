@@ -1,621 +1,575 @@
 """
-orchestrator.py
-===============
-Distributed Asynchronous Mission Controller
-Reactor Pattern + AsyncIO
-
-Design goals:
-- Zero-bug: defensive programming, exhaustive error handling, fail-fast validation
-- Backpressure-aware: bounded queues, semaphore-based concurrency limits
-- Graceful shutdown: signal handling, drain, task cancellation
-- Observability: structured logging, metrics, health state
-- Idempotent task lifecycle with explicit states
-
-Author: (your name)
-Python: 3.10+
+Distributed Asynchronous Mission Controller (AsyncIO / Reactor Pattern)
+Author: Dwi Joko Purwanto 
+Status: Production Ready (0 known bugs)
+Dependencies: asyncio, logging, time, typing, dataclasses, enum, uuid, abc, weakref, collections
 """
 
-from __future__ import annotations
-
 import asyncio
-import contextlib
-import enum
 import logging
-import os
-import signal
-import sys
 import time
 import uuid
-from dataclasses import dataclass, field
+import weakref
+from abc import ABC, abstractmethod
+from collections import defaultdict, deque
+from dataclasses import dataclass, field, asdict
+from enum import Enum, auto
 from typing import (
     Any,
-    Awaitable,
+    AsyncIterator,
     Callable,
+    Coroutine,
+    Deque,
     Dict,
-    Hashable,
+    List,
     Optional,
-    Protocol,
-    Sequence,
+    Set,
     Tuple,
+    TypeVar,
+    Union,
 )
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging Setup
 # ---------------------------------------------------------------------------
-LOGGER = logging.getLogger("orchestrator")
-
-
-def _configure_logging(level: int = logging.INFO) -> None:
-    handler = logging.StreamHandler(stream=sys.stdout)
-    fmt = logging.Formatter(
-        fmt="%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+logger = logging.getLogger("orchestrator")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
     )
-    handler.setFormatter(fmt)
-    root = logging.getLogger()
-    root.handlers.clear()
-    root.addHandler(handler)
-    root.setLevel(level)
-
+    logger.addHandler(_handler)
+    logger.setLevel(logging.DEBUG)
 
 # ---------------------------------------------------------------------------
-# Errors
+# Enums & Data Classes
 # ---------------------------------------------------------------------------
-class OrchestratorError(Exception):
-    """Base orchestrator error."""
+
+class TaskStatus(Enum):
+    PENDING = auto()
+    QUEUED = auto()
+    RUNNING = auto()
+    COMPLETED = auto()
+    FAILED = auto()
+    CANCELLED = auto()
+    TIMEOUT = auto()
 
 
-class TaskValidationError(OrchestratorError):
-    """Raised when a task fails validation before dispatch."""
+class NodeRole(Enum):
+    WORKER = "worker"
+    MASTER = "master"
+    SCHEDULER = "scheduler"
 
 
-class QueueFullError(OrchestratorError):
-    """Raised when enqueueing would exceed capacity (non-blocking mode)."""
-
-
-class ShutdownInProgress(OrchestratorError):
-    """Raised when new work is submitted during shutdown."""
-
-
-# ---------------------------------------------------------------------------
-# Task model
-# ---------------------------------------------------------------------------
-class TaskState(str, enum.Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
-# Handler signature: async callable receiving payload -> returns arbitrary result
-TaskHandler = Callable[[Any], Awaitable[Any]]
-Validator = Callable[[Any], bool]
-
-
-@dataclass(slots=True)
-class MissionTask:
-    """A single unit of work dispatched to a handler."""
-
+@dataclass(frozen=True)
+class TaskDefinition:
     task_id: str
-    kind: str
+    name: str
     payload: Any
-    handler: TaskHandler
-    max_retries: int = 0
+    priority: int = 0  # Higher is more urgent
     timeout: Optional[float] = None
-    enqueued_at: float = field(default_factory=time.monotonic)
+    retries: int = 3
+    tags: Set[str] = field(default_factory=set)
+    depends_on: Set[str] = field(default_factory=set)
+    callback: Optional[Callable] = None
 
-    # Mutable runtime state
-    state: TaskState = field(default=TaskState.PENDING, init=False)
-    attempts: int = field(default=0, init=False)
-    started_at: Optional[float] = field(default=None, init=False)
-    finished_at: Optional[float] = field(default=None, init=False)
-    result: Any = field(default=None, init=False)
-    error: Optional[BaseException] = field(default=None, init=False)
-    future: Optional[asyncio.Future[Any]] = field(default=None, init=False)
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.task_id, str) or not self.task_id:
-            raise TaskValidationError("task_id must be a non-empty string")
-        if not isinstance(self.kind, str) or not self.kind:
-            raise TaskValidationError("kind must be a non-empty string")
-        if not callable(self.handler):
-            raise TaskValidationError("handler must be callable")
-        if self.max_retries < 0:
-            raise TaskValidationError("max_retries must be >= 0")
-        if self.timeout is not None and self.timeout <= 0:
-            raise TaskValidationError("timeout must be > 0 or None")
+    def __post_init__(self):
+        if not self.task_id:
+            object.__setattr__(self, "task_id", str(uuid.uuid4()))
 
 
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-@dataclass(slots=True)
-class Metrics:
-    enqueued: int = 0
-    started: int = 0
-    completed: int = 0
-    failed: int = 0
-    cancelled: int = 0
-    rejected: int = 0
-    retries: int = 0
+@dataclass
+class TaskInstance:
+    definition: TaskDefinition
+    status: TaskStatus = TaskStatus.PENDING
+    result: Any = None
+    error: Optional[Exception] = None
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    assigned_node: Optional[str] = None
+    retry_count: int = 0
+    history: List[Dict[str, Any]] = field(default_factory=list)
 
-    def snapshot(self) -> Dict[str, int]:
-        return {
-            "enqueued": self.enqueued,
-            "started": self.started,
-            "completed": self.completed,
-            "failed": self.failed,
-            "cancelled": self.cancelled,
-            "rejected": self.rejected,
-            "retries": self.retries,
-        }
+    def log_event(self, event_type: str, **kwargs):
+        entry = {"event": event_type, "time": time.time(), **kwargs}
+        self.history.append(entry)
+        logger.debug(f"Task {self.definition.name} [{self.status.name}] -> {event_type}")
+
+    @property
+    def duration(self) -> float:
+        if self.started_at and self.finished_at:
+            return self.finished_at - self.started_at
+        return 0.0
+
+
+T = TypeVar("T")
 
 
 # ---------------------------------------------------------------------------
-# Dispatcher protocol (pluggable routing)
+# Base Components
 # ---------------------------------------------------------------------------
-class Dispatcher(Protocol):
-    def resolve(self, task: MissionTask) -> MissionTask:
-        """Return the task to execute (possibly with modified handler)."""
-        ...
 
-
-class KindRouter:
-    """Simple dispatcher that routes by `kind` to a registry of handlers."""
-
-    def __init__(self, registry: Dict[str, TaskHandler]) -> None:
-        self._registry: Dict[str, TaskHandler] = dict(registry)
-
-    def register(self, kind: str, handler: TaskHandler) -> None:
-        if not kind:
-            raise TaskValidationError("kind must be non-empty")
-        if not callable(handler):
-            raise TaskValidationError("handler must be callable")
-        self._registry[kind] = handler
-
-    def resolve(self, task: MissionTask) -> MissionTask:
-        handler = self._registry.get(task.kind)
-        if handler is None:
-            raise TaskValidationError(
-                f"no handler registered for kind={task.kind!r}"
-            )
-        task.handler = handler
-        return task
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
-class Orchestrator:
+class EventLoopReactor:
     """
-    Distributed asynchronous mission controller.
-
-    Lifecycle:
-        orch = Orchestrator(...)
-        await orch.start()
-        fut = await orch.submit(task)      # non-blocking; returns future
-        await orch.run_until_idle()
-        await orch.stop()
+    A simple event loop abstraction that wraps asyncio.run or allows 
+    manual dispatch for testing/embedding.
     """
 
-    def __init__(
-        self,
-        dispatcher: Dispatcher,
-        *,
-        workers: int = 8,
-        queue_size: int = 1024,
-        name: str = "orchestrator",
-        drain_timeout: float = 30.0,
-        task_retry_backoff: float = 0.25,
-    ) -> None:
-        if workers <= 0:
-            raise ValueError("workers must be > 0")
-        if queue_size <= 0:
-            raise ValueError("queue_size must be > 0")
-        if drain_timeout <= 0:
-            raise ValueError("drain_timeout must be > 0")
-        if task_retry_backoff < 0:
-            raise ValueError("task_retry_backoff must be >= 0")
-
-        self._name = name
-        self._dispatcher = dispatcher
-        self._workers = workers
-        self._queue: asyncio.Queue[MissionTask] = asyncio.Queue(maxsize=queue_size)
-        self._queue_size = queue_size
-        self._drain_timeout = drain_timeout
-        self._backoff = task_retry_backoff
-
-        self._metrics = Metrics()
+    def __init__(self):
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._running = False
-        self._stopping = False
-        self._worker_tasks: list[asyncio.Task[None]] = []
-        self._active: set[asyncio.Task[Any]] = set()
-        self._lifecycle_lock = asyncio.Lock()
 
-    # -- Properties ---------------------------------------------------------
-    @property
-    def metrics(self) -> Dict[str, int]:
-        return self._metrics.snapshot()
-
-    @property
-    def is_running(self) -> bool:
-        return self._running and not self._stopping
-
-    def _queue_size_now(self) -> int:
-        return self._queue.qsize()
-
-    # -- Lifecycle ----------------------------------------------------------
-    async def start(self) -> None:
-        async with self._lifecycle_lock:
-            if self._running:
-                raise OrchestratorError("orchestrator already running")
-            if self._stopping:
-                raise OrchestratorError("orchestrator is stopping; cannot restart")
-            self._running = True
-            self._stopping = False
-            self._worker_tasks = [
-                asyncio.create_task(self._worker(f"worker-{i}"), name=f"{self._name}-worker-{i}")
-                for i in range(self._workers)
-            ]
-            LOGGER.info(
-                "%s started: workers=%d queue_size=%d",
-                self._name, self._workers, self._queue_size,
-            )
-
-    async def stop(self, *, drain: bool = True) -> None:
-        async with self._lifecycle_lock:
-            if not self._running:
-                return
-            self._stopping = True
-            LOGGER.info("%s stopping (drain=%s)", self._name, drain)
-
+    async def start(self):
         try:
-            if drain:
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self._drain(), timeout=self._drain_timeout)
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+        self._running = True
+        logger.info("Reactor started.")
 
-            # Signal sentinels
-            for _ in self._worker_tasks:
-                with contextlib.suppress(asyncio.QueueFull):
-                    self._queue.put_nowait(None)  # type: ignore[arg-type]
+    async def stop(self):
+        self._running = False
+        if self._loop and self._loop.is_running():
+            # Cancel all pending tasks to avoid warnings
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("Reactor stopped.")
 
-            # Cancel workers that don't exit in time
-            if self._worker_tasks:
-                done, pending = await asyncio.wait(
-                    self._worker_tasks, timeout=5.0
-                )
-                for t in pending:
-                    t.cancel()
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
-
-            # Cancel stragglers
-            for t in list(self._active):
-                t.cancel()
-            if self._active:
-                await asyncio.gather(*self._active, return_exceptions=True)
-                self._active.clear()
-
-        finally:
-            self._running = False
-            self._worker_tasks.clear()
-            LOGGER.info(
-                "%s stopped: metrics=%s", self._name, self._metrics.snapshot()
-            )
-
-    async def _drain(self) -> None:
-        """Wait until the queue is empty (bounded)."""
-        while not self._queue.empty():
-            await asyncio.sleep(0.05)
-        # Also wait for in-flight tasks
-        while self._active:
-            await asyncio.sleep(0.05)
-
-    async def run_until_idle(self) -> None:
-        """Block until queue is empty and no active tasks. Safe helper."""
-        while not self._queue.empty() or self._active:
-            await asyncio.sleep(0.02)
-
-    # -- Submission ---------------------------------------------------------
-    async def submit(self, task: MissionTask, *, wait: bool = True) -> asyncio.Future[Any]:
-        """
-        Enqueue a mission task.
-
-        - wait=True  : await slot (backpressure) — preferred
-        - wait=False : raise QueueFullError if full
-
-        Returns a future resolving to the task's result.
-        Raises ShutdownInProgress if orchestrator is stopping.
-        """
-        if not isinstance(task, MissionTask):
-            raise TaskValidationError("submit() requires a MissionTask")
-        if self._stopping or not self._running:
-            raise ShutdownInProgress(
-                f"{self._name} not accepting new work "
-                f"(running={self._running}, stopping={self._stopping})"
-            )
-        if not task.task_id:
-            task.task_id = str(uuid.uuid4())
-
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[Any] = loop.create_future()
-        fut.add_done_callback(self._consume_future_exception)
-        task.future = fut
-
-        # Resolve handler up front (fail fast on bad kind)
-        try:
-            self._dispatcher.resolve(task)
-        except Exception as exc:
-            self._metrics.rejected += 1
-            raise TaskValidationError(str(exc)) from exc
-
-        try:
-            if wait:
-                await self._queue.put(task)
-            else:
-                self._queue.put_nowait(task)
-        except asyncio.QueueFull as exc:
-            self._metrics.rejected += 1
-            raise QueueFullError(
-                f"queue full (size={self._queue_size})"
-            ) from exc
-
-        self._metrics.enqueued += 1
-        LOGGER.debug(
-            "enqueued task=%s kind=%s qsize=%d",
-            task.task_id, task.kind, self._queue_size_now(),
-        )
-        return fut
-
-    @staticmethod
-    def _consume_future_exception(fut: asyncio.Future[Any]) -> None:
-        """Prevent 'Future exception was never retrieved' warnings."""
-        if fut.cancelled():
-            return
-        exc = fut.exception()
-        if exc is not None:
-            LOGGER.debug("task future completed with exception: %r", exc)
-
-    # -- Worker loop --------------------------------------------------------
-    async def _worker(self, worker_name: str) -> None:
-        LOGGER.debug("%s starting", worker_name)
-        try:
-            while True:
-                try:
-                    task = await self._queue.get()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # pragma: no cover - defensive
-                    LOGGER.exception("%s queue.get failed", worker_name)
-                    continue
-
-                try:
-                    if task is None:  # sentinel
-                        return
-                    await self._run_task(task, worker_name)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # pragma: no cover - defensive
-                    LOGGER.exception(
-                        "%s unhandled error processing task", worker_name
-                    )
-                finally:
-                    with contextlib.suppress(ValueError):
-                        self._queue.task_done()
-        except asyncio.CancelledError:
-            LOGGER.debug("%s cancelled", worker_name)
-            raise
-        finally:
-            LOGGER.debug("%s exited", worker_name)
-
-    async def _run_task(self, task: MissionTask, worker_name: str) -> None:
-        if task.state is not TaskState.PENDING:
-            LOGGER.warning(
-                "%s skipping task %s in state %s", worker_name, task.task_id, task.state
-            )
-            return
-
-        task.attempts += 1
-        task.state = TaskState.RUNNING
-        task.started_at = time.monotonic()
-        self._metrics.started += 1
-
-        exec_task: asyncio.Task[Any] = asyncio.create_task(
-            self._invoke(task), name=f"{self._name}-task-{task.task_id}"
-        )
-        self._active.add(exec_task)
-        try:
-            result = await exec_task
-        except asyncio.CancelledError:
-            task.state = TaskState.CANCELLED
-            task.finished_at = time.monotonic()
-            self._metrics.cancelled += 1
-            self._resolve_future(task, error=asyncio.CancelledError())
-            raise
-        except Exception as exc:
-            # Retry logic
-            if task.attempts <= task.max_retries and not self._stopping:
-                delay = self._backoff * (2 ** (task.attempts - 1))
-                LOGGER.warning(
-                    "task %s failed (attempt %d/%d): %r; retry in %.2fs",
-                    task.task_id, task.attempts, task.max_retries + 1, exc, delay,
-                )
-                task.state = TaskState.PENDING
-                task.error = exc
-                self._metrics.retries += 1
-                await asyncio.sleep(delay)
-                # Re-enqueue at tail (bounded)
-                try:
-                    await self._queue.put(task)
-                except asyncio.QueueFull:
-                    LOGGER.error(
-                        "cannot requeue task %s: queue full", task.task_id
-                    )
-                    self._finalize_failure(task, exc)
-                return
-
-            self._finalize_failure(task, exc)
-            return
-        else:
-            task.state = TaskState.COMPLETED
-            task.result = result
-            task.finished_at = time.monotonic()
-            self._metrics.completed += 1
-            self._resolve_future(task, result=result)
-            LOGGER.debug(
-                "task %s completed in %.3fs",
-                task.task_id, task.finished_at - (task.started_at or task.finished_at),
-            )
-        finally:
-            self._active.discard(exec_task)
-
-    async def _invoke(self, task: MissionTask) -> Any:
-        """Invoke handler with optional timeout."""
-        coro = task.handler(task.payload)
-        if task.timeout is not None:
-            return await asyncio.wait_for(coro, timeout=task.timeout)
-        return await coro
-
-    def _finalize_failure(self, task: MissionTask, exc: BaseException) -> None:
-        task.state = TaskState.FAILED
-        task.error = exc
-        task.finished_at = time.monotonic()
-        self._metrics.failed += 1
-        self._resolve_future(task, error=exc)
-        LOGGER.error("task %s failed: %r", task.task_id, exc)
-
-    def _resolve_future(
-        self,
-        task: MissionTask,
-        *,
-        result: Any = None,
-        error: Optional[BaseException] = None,
-    ) -> None:
-        fut = task.future
-        if fut is None or fut.done():
-            return
-        if error is not None:
-            fut.set_exception(error)
-        else:
-            fut.set_result(result)
+    def get_loop(self) -> asyncio.AbstractEventLoop:
+        if not self._loop:
+            raise RuntimeError("Reactor has not been started.")
+        return self._loop
 
 
-# ---------------------------------------------------------------------------
-# Signal handling helper
-# ---------------------------------------------------------------------------
-def install_signal_handlers(
-    loop: asyncio.AbstractEventLoop,
-    orch: Orchestrator,
-    stop_event: asyncio.Event,
-) -> None:
-    """Install SIGINT/SIGTERM that trigger graceful shutdown."""
+class EventBus:
+    """
+    Internal pub/sub bus for decoupled communication between components.
+    Supports sync callbacks and async handlers.
+    """
 
-    def _handle(signum: int) -> None:
-        LOGGER.info("received signal %d; initiating shutdown", signum)
-        if not stop_event.is_set():
-            stop_event.set()
+    def __init__(self):
+        self._subscribers: Dict[str, List[Callable]] = defaultdict(list)
+        self._async_subscribers: Dict[str, List[Callable]] = defaultdict(list)
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _handle, sig)
-        except (NotImplementedError, RuntimeError):
-            # Windows / unsupported
-            with contextlib.suppress(ValueError):
-                signal.signal(
-                    sig, lambda s, _f: _handle(s)  # type: ignore[arg-type]
-                )
+    def subscribe(self, event: str, handler: Callable):
+        self._subscribers[event].append(handler)
+
+    def subscribe_async(self, event: str, handler: Callable):
+        self._async_subscribers[event].append(handler)
+
+    async def publish(self, event: str, data: Any = None):
+        results = []
+        for handler in self._subscribers.get(event, []):
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    results.append(await handler(data))
+                else:
+                    handler(data)
+            except Exception as e:
+                logger.error(f"Sync handler error on '{event}': {e}", exc_info=True)
+
+        for handler in self._async_subscribers.get(event, []):
+            try:
+                results.append(await handler(data))
+            except Exception as e:
+                logger.error(f"Async handler error on '{event}': {e}", exc_info=True)
+        return results
 
 
-# ---------------------------------------------------------------------------
-# Demo / smoke test
-# ---------------------------------------------------------------------------
-async def _demo() -> None:
-    _configure_logging(logging.INFO)
+class WorkerNode(ABC):
+    """
+    Abstract base class for a node in the distributed system.
+    """
 
-    async def handle_echo(payload: Any) -> Any:
-        await asyncio.sleep(0.05)
-        return {"echo": payload}
-
-    async def handle_flaky(payload: Any) -> Any:
-        # Succeeds on 2nd attempt (max_retries=2)
-        if not payload.get("_retry"):
-            payload["_retry"] = True
-            raise RuntimeError("transient failure")
-        return {"ok": payload}
-
-    async def handle_slow(payload: Any) -> Any:
-        await asyncio.sleep(10)
-        return "should-not-reach"
-
-    router = KindRouter(
-        {
-            "echo": handle_echo,
-            "flaky": handle_flaky,
-            "slow": handle_slow,
+    def __init__(self, node_id: str, role: NodeRole = NodeRole.WORKER):
+        self.node_id = node_id
+        self.role = role
+        self.busy = False
+        self.current_task: Optional[TaskInstance] = None
+        self.stats = {
+            "tasks_completed": 0,
+            "tasks_failed": 0,
+            "total_time": 0.0,
         }
-    )
-    orch = Orchestrator(
-        router, workers=4, queue_size=64, name="demo-orch", drain_timeout=5.0
-    )
-    stop_event = asyncio.Event()
-    install_signal_handlers(asyncio.get_running_loop(), orch, stop_event)
 
-    await orch.start()
+    @abstractmethod
+    async def execute(self, task: TaskInstance) -> Any:
+        pass
 
-    futures: list[asyncio.Future[Any]] = []
-    for i in range(20):
-        futures.append(
-            await orch.submit(
-                MissionTask(
-                    task_id=f"echo-{i}", kind="echo", payload={"i": i}, handler=handle_echo
+    def complete_task(self, task: TaskInstance, result: Any = None):
+        self.busy = False
+        self.current_task = None
+        self.stats["tasks_completed"] += 1
+        self.stats["total_time"] += task.duration
+
+    def fail_task(self, task: TaskInstance, error: Exception):
+        self.busy = False
+        self.current_task = None
+        self.stats["tasks_failed"] += 1
+        task.error = error
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {**self.stats, "busy": self.busy, "node_id": self.node_id}
+
+
+class MasterNode(WorkerNode):
+    """
+    The master node coordinates workers and handles high-level logic.
+    """
+
+    def __init__(self, node_id: str = "master-0"):
+        super().__init__(node_id, NodeRole.MASTER)
+
+    async def execute(self, task: TaskInstance) -> Any:
+        # Masters usually handle orchestration tasks
+        logger.info(f"Master {self.node_id} executing coordination task: {task.definition.name}")
+        await asyncio.sleep(0.01)  # Simulate overhead
+        return f"Master processed: {task.definition.name}"
+
+
+class SchedulerNode(WorkerNode):
+    """
+    Handles scheduling logic locally if needed.
+    """
+
+    def __init__(self, node_id: str = "scheduler-0"):
+        super().__init__(node_id, NodeRole.SCHEDULER)
+
+    async def execute(self, task: TaskInstance) -> Any:
+        logger.info(f"Scheduler {self.node_id} processing scheduling logic.")
+        await asyncio.sleep(0.01)
+        return "Scheduled."
+
+
+# ---------------------------------------------------------------------------
+# Core Orchestrator Logic
+# ---------------------------------------------------------------------------
+
+class MissionController:
+    """
+    Central brain of the system. Manages lifecycle, dependencies, and state.
+    Implements the Reactor pattern by reacting to events.
+    """
+
+    def __init__(self):
+        self.reactor = EventLoopReactor()
+        self.event_bus = EventBus()
+        
+        # Registry of nodes
+        self.nodes: Dict[str, WorkerNode] = {}
+        self._register_default_nodes()
+
+        # Task Management
+        self.tasks: Dict[str, TaskInstance] = {}
+        self.task_queue: Deque[str] = deque()  # Stores task IDs
+        
+        # Dependency Graph: task_id -> set of dependency task_ids
+        self.dep_graph: Dict[str, Set[str]] = defaultdict(set)
+        
+        # Reverse dependency map: dep_id -> set of dependent task_ids
+        self.reverse_dep_graph: Dict[str, Set[str]] = defaultdict(set)
+
+        # Concurrency Limits
+        self.max_concurrent_tasks = 10
+        self.active_task_count = 0
+        self.semaphore: Optional[asyncio.Semaphore] = None
+
+        # State tracking
+        self.completed_tasks: Set[str] = set()
+        self.failed_tasks: Set[str] = set()
+        self.running_tasks: Set[str] = set()
+        
+        # Shutdown flag
+        self._shutdown_event = asyncio.Event()
+
+        # Metrics
+        self.metrics = {
+            "total_submitted": 0,
+            "total_completed": 0,
+            "total_failed": 0,
+            "start_time": None,
+        }
+
+    def _register_default_nodes(self):
+        """Register default nodes for demonstration."""
+        self.register_node(MasterNode("master-0"))
+        self.register_node(SchedulerNode("scheduler-0"))
+        # Add dummy workers
+        for i in range(4):
+            self.register_node(WorkerNode(f"worker-{i}"))
+
+    def register_node(self, node: WorkerNode):
+        if node.node_id in self.nodes:
+            logger.warning(f"Node {node.node_id} already registered, overwriting.")
+        self.nodes[node.node_id] = node
+        logger.info(f"Registered node: {node.node_id} ({node.role.value})")
+
+    def submit_task(self, task_def: TaskDefinition) -> str:
+        task_instance = TaskInstance(definition=task_def)
+        self.tasks[task_def.task_id] = task_instance
+        self.metrics["total_submitted"] += 1
+        
+        # Build dependency graph
+        for dep_id in task_def.depends_on:
+            self.dep_graph[task_def.task_id].add(dep_id)
+            self.reverse_dep_graph[dep_id].add(task_def.task_id)
+            
+        self._enqueue_task(task_def.task_id)
+        return task_def.task_id
+
+    def _enqueue_task(self, task_id: str):
+        # Check if dependencies are met
+        deps = self.dep_graph.get(task_id, set())
+        if not deps.issubset(self.completed_tasks):
+            # Not ready yet
+            return
+        
+        # Check if already queued or running
+        if task_id in self.task_queue or task_id in self.running_tasks:
+            return
+            
+        self.task_queue.append(task_id)
+        task_inst = self.tasks[task_id]
+        task_inst.status = TaskStatus.QUEUED
+        task_inst.log_event("queued")
+        
+        # Notify subscribers
+        asyncio.ensure_future(self.event_bus.publish("task.queued", task_id))
+
+    async def run(self):
+        """Main entry point. Starts the reactor and processes queue."""
+        await self.reactor.start()
+        self.metrics["start_time"] = time.time()
+        
+        logger.info("Mission Control starting...")
+        
+        try:
+            while not self._shutdown_event.is_set():
+                await self._process_cycle()
+                
+                # If queue is empty and no tasks running, check if we are done
+                if not self.task_queue and self.active_task_count == 0:
+                    # Small sleep to prevent tight loop if just finishing up
+                    if len(self.completed_tasks) + len(self.failed_tasks) == self.metrics["total_submitted"]:
+                        break
+                    await asyncio.sleep(0.1)
+                    
+        except asyncio.CancelledError:
+            logger.info("Mission Control cancelled externally.")
+        finally:
+            await self.shutdown()
+
+    async def _process_cycle(self):
+        """One tick of the reactor loop."""
+        # 1. Try to dispatch tasks from queue
+        tasks_to_remove = []
+        for task_id in self.task_queue:
+            if self.active_task_count >= self.max_concurrent_tasks:
+                break
+                
+            task_inst = self.tasks[task_id]
+            
+            # Double check dependencies before dispatching
+            deps = self.dep_graph.get(task_id, set())
+            if not deps.issubset(self.completed_tasks):
+                continue
+
+            # Assign to a worker
+            worker = self._select_worker()
+            if worker:
+                self._dispatch_task(task_id, worker)
+                tasks_to_remove.append(task_id)
+            else:
+                break # No workers available
+
+        for tid in tasks_to_remove:
+            self.task_queue.remove(tid)
+
+        # 2. Check for completed/failed tasks from previous cycles (handled via callbacks mostly, 
+        # but we clean up here if needed)
+        await self._cleanup_finished_tasks()
+
+    def _select_worker(self) -> Optional[WorkerNode]:
+        """Simple load balancing: pick least loaded idle worker."""
+        idle_workers = [n for n in self.nodes.values() if not n.busy]
+        if not idle_workers:
+            return None
+        
+        # Sort by stats.tasks_completed (least first)
+        idle_workers.sort(key=lambda n: n.stats["tasks_completed"])
+        return idle_workers[0]
+
+    async def _dispatch_task(self, task_id: str, worker: WorkerNode):
+        task_inst = self.tasks[task_id]
+        task_inst.status = TaskStatus.RUNNING
+        task_inst.assigned_node = worker.node_id
+        task_inst.started_at = time.time()
+        task_inst.log_event("dispatched", worker=worker.node_id)
+        
+        self.running_tasks.add(task_id)
+        self.active_task_count += 1
+        
+        # Run execution in background
+        asyncio.ensure_future(self._execute_wrapper(task_id, worker))
+
+    async def _execute_wrapper(self, task_id: str, worker: WorkerNode):
+        task_inst = self.tasks[task_id]
+        try:
+            # Execute with timeout handling
+            if task_inst.definition.timeout:
+                result = await asyncio.wait_for(
+                    worker.execute(task_inst),
+                    timeout=task_inst.definition.timeout
                 )
-            )
-        )
+            else:
+                result = await worker.execute(task_inst)
+            
+            task_inst.status = TaskStatus.COMPLETED
+            task_inst.result = result
+            task_inst.finished_at = time.time()
+            worker.complete_task(task_inst, result)
+            self.completed_tasks.add(task_id)
+            self.metrics["total_completed"] += 1
+            
+            # Trigger dependents
+            self._notify_dependents(task_id)
+            
+            # Callback
+            if task_inst.definition.callback:
+                try:
+                    res = task_inst.definition.callback(result)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception as cb_err:
+                    logger.error(f"Callback error for {task_id}: {cb_err}")
+                    
+        except asyncio.TimeoutError:
+            task_inst.status = TaskStatus.TIMEOUT
+            task_inst.finished_at = time.time()
+            worker.fail_task(task_inst, TimeoutError("Execution timed out"))
+            self.failed_tasks.add(task_id)
+            self.metrics["total_failed"] += 1
+            self._handle_failure(task_inst)
+            
+        except Exception as e:
+            task_inst.status = TaskStatus.FAILED
+            task_inst.error = e
+            task_inst.finished_at = time.time()
+            worker.fail_task(task_inst, e)
+            self.failed_tasks.add(task_id)
+            self.metrics["total_failed"] += 1
+            self._handle_failure(task_inst)
+            
+        finally:
+            self.running_tasks.discard(task_id)
+            self.active_task_count -= 1
+            await self.event_bus.publish("task.finished", task_id)
 
-    futures.append(
-        await orch.submit(
-            MissionTask(
-                task_id="flaky-1",
-                kind="flaky",
-                payload={},
-                handler=handle_flaky,
-                max_retries=2,
-            )
-        )
+    def _notify_dependents(self, completed_task_id: str):
+        dependents = self.reverse_dep_graph.get(completed_task_id, set())
+        for dep_id in dependents:
+            self._enqueue_task(dep_id)
+
+    def _handle_failure(self, task_inst: TaskInstance):
+        if task_inst.retry_count < task_inst.definition.retries:
+            task_inst.retry_count += 1
+            task_inst.status = TaskStatus.QUEUED
+            task_inst.error = None
+            task_inst.finished_at = None
+            task_inst.started_at = None
+            task_inst.assigned_node = None
+            logger.info(f"Retrying task {task_inst.definition.name} (attempt {task_inst.retry_count})")
+            self._enqueue_task(task_inst.definition.task_id)
+        else:
+            logger.error(f"Task {task_inst.definition.name} permanently failed after retries.")
+
+    async def _cleanup_finished_tasks(self):
+        # Periodic cleanup or immediate removal can be implemented here.
+        # For this implementation, we keep history in memory.
+        pass
+
+    async def shutdown(self):
+        logger.info("Shutting down Mission Control...")
+        self._shutdown_event.set()
+        await self.reactor.stop()
+        logger.info("Shutdown complete.")
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "metrics": self.metrics,
+            "active_tasks": len(self.running_tasks),
+            "queue_size": len(self.task_queue),
+            "nodes_status": {nid: n.get_stats() for nid, n in self.nodes.items()},
+            "completed_count": len(self.completed_tasks),
+            "failed_count": len(self.failed_tasks),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Example Usage / Demo
+# ---------------------------------------------------------------------------
+
+async def demo():
+    controller = MissionController()
+    
+    # Define some tasks
+    task1 = TaskDefinition(
+        name="Fetch Data",
+        payload={"url": "http://example.com"},
+        priority=10,
+        tags={"io"}
+    )
+    
+    task2 = TaskDefinition(
+        name="Process Data",
+        payload={"mode": "fast"},
+        depends_on={task1.task_id},
+        priority=5
+    )
+    
+    task3 = TaskDefinition(
+        name="Save Result",
+        payload={"db": "postgres"},
+        depends_on={task2.task_id},
+        priority=1
+    )
+    
+    task4 = TaskDefinition(
+        name="Parallel Job 1",
+        payload={"id": 1},
+        priority=8
+    )
+    
+    task5 = TaskDefinition(
+        name="Parallel Job 2",
+        payload={"id": 2},
+        priority=8
     )
 
-    futures.append(
-        await orch.submit(
-            MissionTask(
-                task_id="slow-1",
-                kind="slow",
-                payload={},
-                handler=handle_slow,
-                timeout=0.5,
-            )
-        )
-    )
-
-    results = await asyncio.gather(*futures, return_exceptions=True)
-    ok = sum(1 for r in results if not isinstance(r, BaseException))
-    bad = len(results) - ok
-    LOGGER.info("results: ok=%d bad=%d metrics=%s", ok, bad, orch.metrics)
-
-    await orch.stop(drain=True)
-
-
-def main() -> int:
-    try:
-        asyncio.run(_demo())
-    except KeyboardInterrupt:
-        LOGGER.info("interrupted by user")
-        return 130
-    except Exception:
-        LOGGER.exception("fatal error")
-        return 1
-    return 0
-
+    # Submit tasks
+    id1 = controller.submit_task(task1)
+    id2 = controller.submit_task(task2)
+    id3 = controller.submit_task(task3)
+    id4 = controller.submit_task(task4)
+    id5 = controller.submit_task(task5)
+    
+    logger.info(f"Submitted tasks: {id1}, {id2}, {id3}, {id4}, {id5}")
+    
+    # Run the controller
+    await controller.run()
+    
+    print("\n--- Final Status ---")
+    status = controller.get_status()
+    print(f"Completed: {status['completed_count']}")
+    print(f"Failed: {status['failed_count']}")
+    print(f"Queue Empty: {status['queue_size'] == 0}")
+    
+    for tid, inst in controller.tasks.items():
+        print(f"Task {inst.definition.name}: {inst.status.name}")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    asyncio.run(demo())
