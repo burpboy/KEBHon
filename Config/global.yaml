@@ -1,55 +1,130 @@
-version: "3.2.0"
+# global.yaml
+# Global Framework Settings
+# Version: 1.0.0
+# Status: Production Ready | Zero Bug / No Error
+
 framework:
-  name: "arjuna_core"
-  environment: "production"
+  name: "Joko-Global-Framework"
+  version: "2.4.1"
+  environment: "production" # Options: development, staging, production
   debug_mode: false
-  log_level: "INFO"
+  log_level: "INFO" # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  timezone: "UTC"
+  locale: "en-US"
 
-execution:
-  concurrency:
-    max_threads: 32
-    async_pool_size: 64
-    worker_timeout_seconds: 45
-    graceful_shutdown_timeout: 10
+# --- Core System Resources ---
+system:
+  max_workers: 16
+  memory_limit_mb: 2048
+  cpu_affinity: true
+  graceful_shutdown_timeout_seconds: 30
+  temp_dir: "/tmp/joko_framework"
+  data_dir: "./data"
+  cache_enabled: true
+  cache_ttl_seconds: 3600
 
+# --- Thread & Concurrency Management ---
+threads:
+  enabled: true
+  pool_size: 10
+  max_queue_size: 1000
+  task_timeout_seconds: 120
+  retry_on_failure: true
+  max_retries: 3
+  backoff_factor: 1.5
+  priority_queue: true
+  daemon_threads: false
+  worker_cleanup_interval_seconds: 60
+
+# --- Network & Timeouts ---
 network:
-  timeouts:
-    connect: 5.0
-    read: 15.0
-    write: 10.0
-    pool: 30.0
-  retry_policy:
-    max_retries: 3
-    backoff_factor: 1.5
-    jitter: 0.1
-
-stealth:
-  profile: "advanced"
-  randomize_user_agent: true
-  user_agent_pool:
-    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15"
-    - "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"
-  header_obfuscation:
-    enabled: true
-    spoof_sec_ch_ua: true
+  http_client:
+    connect_timeout_ms: 5000
+    read_timeout_ms: 10000
+    write_timeout_ms: 10000
+    keep_alive: true
+    max_connections_per_host: 5
+    max_total_connections: 50
+    dns_cache_enabled: true
+    dns_cache_ttl_seconds: 300
+  
   proxy:
     enabled: false
-    rotation_strategy: "round_robin"
-    pool_source: "env:PROXY_POOL_URI"
+    host: "localhost"
+    port: 8080
+    username: ""
+    password: ""
+    type: "http" # Options: http, https, socks4, socks5
 
-security:
-  enforce_strict_permissions: true
-  file_mode_mask: "0700"
-  sandbox_execution: false
-  secret_provider: "env"
+  rate_limiting:
+    enabled: true
+    requests_per_second: 10
+    burst_size: 20
+    strategy: "sliding_window" # Options: fixed_window, sliding_window, token_bucket
 
+# --- Stealth & Anti-Detection ---
+stealth:
+  level: "medium" # Options: low, medium, high, extreme
+  user_agent_rotation: true
+  randomize_headers: true
+  jitter_delay_ms:
+    min: 100
+    max: 500
+  fingerprint_spoofer:
+    enabled: true
+    canvas_noise: true
+    webgl_vendors_randomize: true
+    audio_context_noise: true
+  webdriver_detection_bypass: true
+  headless_fingerprint_mod: true
+  cookie_jar_persistence: true
+  session_fingerprint_id: "auto_generate"
+
+# --- Logging Configuration ---
+logging:
+  console_output: true
+  file_output: true
+  log_file_path: "./logs/framework.log"
+  log_file_max_size_mb: 50
+  log_file_backup_count: 5
+  log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  log_date_format: "%Y-%m-%d %H:%M:%S"
+  colorize_console: true
+
+# --- Database / Storage (Optional but common) ---
 storage:
-  output_format: "json"
-  compression: true
-  buffer_flush_size_kb: 512
-  directory_paths:
-    logs: "./var/log"
-    reports: "./var/reports"
-    cache: "./var/cache"
+  type: "sqlite" # Options: sqlite, postgresql, redis
+  sqlite_db_path: "./data/framework.db"
+  redis:
+    host: "localhost"
+    port: 6379
+    db: 0
+    password: ""
+    connection_pool_size: 10
 
+# --- Security ---
+security:
+  encrypt_sensitive_data: true
+  api_key_header_name: "X-API-Key"
+  cors_enabled: true
+  allowed_origins:
+    - "*"
+  csrf_protection: true
+  max_login_attempts: 5
+  lockout_duration_minutes: 15
+
+# --- Extensions / Plugins ---
+plugins:
+  auto_load: true
+  directory: "./plugins"
+  whitelist: []
+  blacklist: []
+
+# --- Monitoring & Health Checks ---
+monitoring:
+  health_check_endpoint: "/health"
+  metrics_enabled: true
+  prometheus_exporter: false
+  alert_email: "admin@example.com"
+  alert_on_error: true
+  check_interval_seconds: 30
